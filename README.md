@@ -1,2 +1,2 @@
-# SLG_MyTest
-途游SLG工程的个人文件夹
+# _MyTest_SLG
+SLG工程的个人文件夹
