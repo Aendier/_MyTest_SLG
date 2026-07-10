@@ -11,20 +11,32 @@ namespace UIR.EditorTools
     {
         // ==================== SVN 工具 ====================
         
-        [MenuItem("UIR/Svn/提交资源", false, 100)]
+        [MenuItem("UIR/提交资源", false, 100)]
         private static void Menu_SvnCommit()
         {
             SvnTools.CommitGameAssets();
         }
 
-        [MenuItem("UIR/Svn/更新工程", false, 101)]
+        [MenuItem("UIR/更新工程", false, 101)]
         private static void Menu_SvnUpdate()
         {
             SvnTools.UpdateProject();
         }
 
-        // ==================== 未来扩展示例 ====================
-        // [MenuItem("UIR/Build/打包Android", false, 200)]
-        // private static void Menu_BuildAndroid() { BuildTools.BuildAndroid(); }
+        // ==================== UI 工具 ====================
+
+        [MenuItem("UIR/Create UI Folder", false, 200)]
+        private static void Menu_CreateUIFolder()
+        {
+            UIFolderCreatorWindow.Open();
+        }
+
+        // ==================== 图片工具 ====================
+
+        [MenuItem("UIR/图搜图", false, 300)]
+        private static void Menu_ImageSimilaritySearch()
+        {
+            ImageSimilaritySearchWindow.Open();
+        }
     }
 }
