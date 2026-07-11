@@ -28,46 +28,21 @@ namespace UIR.EditorTools
         // 时间切片：每帧最多占用的处理时长（秒），保证编辑器不卡顿。
         private const double TickTimeBudgetSeconds = 0.03;
 
-        // pHash 参数：降采样尺寸；低频块尺寸按“高精度”开关取 8(64 位) 或 16(256 位)。
-        private const int HashSampleSize = 32;
+        // pHash 参数：低频块尺寸按“高精度”开关取 8(64 位) 或 16(256 位)；
+        // 采样尺寸 = 低频块 × 4，保证两种模式取用相同的低频带，避免高精度引入高频噪声。
         private const int LowFreqNormal = 8;
         private const int LowFreqHigh = 16;
+        private const int SampleScale = 4;
 
         // 结果缩略图尺寸。
         private const int ThumbnailSize = 96;
 
-        /// <summary>单条检索结果（在 Odin TableList 中以表格行展示）。</summary>
+        /// <summary>单条检索结果（结果区由原生 IMGUI 逐行绘制，见 OnEndDrawEditors）。</summary>
         private class MatchItem
         {
-            // 完整磁盘路径，仅供按钮使用，不在表格中显示为列。
-            [HideInInspector] public string FullPath;
-
-            [TableColumnWidth(64, false)]
-            [PreviewField(54f, ObjectFieldAlignment.Center), HideLabel]
-            [ShowInInspector]
-            public Texture2D Thumbnail;
-
-            [TableColumnWidth(160, false)]
-            [ProgressBar(0, 1, r: 0.30f, g: 0.65f, b: 1f)]
-            [ShowInInspector, LabelText("相似度")]
-            public float Similarity;
-
-            [ShowInInspector, LabelText("文件"), DisplayAsString]
-            [PropertyTooltip("$FullPath")]
-            private string DisplayName => System.IO.Path.GetFileName(FullPath);
-
-            [TableColumnWidth(120, false)]
-            [HorizontalGroup("Ops"), Button("定位")]
-            private void Locate()
-            {
-                LocateResult(FullPath);
-            }
-
-            [HorizontalGroup("Ops"), Button("打开")]
-            private void Reveal()
-            {
-                UnityEditor.EditorUtility.RevealInFinder(FullPath);
-            }
+            public string FullPath;     // 完整磁盘路径
+            public float Similarity;    // 相似度（0~1）
+            public Texture2D Thumbnail; // 结果缩略图
         }
 
         // ===== 查询图 =====
@@ -100,6 +75,10 @@ namespace UIR.EditorTools
         [LabelText("包含子目录"), ShowInInspector, PropertyOrder(11)]
         private bool m_recursive = true;
 
+        [LabelText("排除查询图自身"), ShowInInspector, PropertyOrder(11.5f)]
+        [Tooltip("勾选后不显示与查询图同一路径的源文件；想验证管线或查找完全相同的重复图时请取消勾选")]
+        private bool m_excludeSelf = false;
+
         [PropertyRange(0f, 1f)]
         [LabelText("相似度阈值"), ShowInInspector, PropertyOrder(12)]
         private float m_threshold = 0.80f;
@@ -119,8 +98,8 @@ namespace UIR.EditorTools
         private Color m_backgroundColor = Color.white;
 
         [LabelText("高精度哈希 (256 位)"), ShowInInspector, PropertyOrder(16)]
-        [Tooltip("低频块 8×8→16×16，区分度更高、误配更少（速度影响很小）")]
-        private bool m_highPrecision = true;
+        [Tooltip("低频块 8×8→16×16、采样 32→64，区分度更高但更严格；命中偏少时可关闭或调低阈值")]
+        private bool m_highPrecision = false;
 
         // ===== 检索运行时状态 =====
         private bool m_isSearching;
@@ -131,16 +110,28 @@ namespace UIR.EditorTools
         private int m_scannedCount;
         private int m_failedCount;
         private string m_statusText = "";
+        private Vector2 m_resultScroll;  // 结果独立滚动列表的滚动位置
 
         // DCT 预计算表（懒加载）。
         private static float[,] s_dctCos;   // [k, n]
         private static float[] s_dctAlpha;  // [k]
 
+        // 关闭窗口整体滚动：配置区固定在顶部，结果用原生 IMGUI 的独立滚动列表（见 OnEndDrawEditors），
+        // 避免与窗口滚动条重叠，且原生滚动条/按钮点击稳定可靠。
+        public override bool UseScrollView => false;
+
         /// <summary>打开窗口。菜单入口在 UIRMenuRegister 中统一注册。</summary>
         public static void Open()
         {
             var window = GetWindow<ImageSimilaritySearchWindow>("图搜图");
-            window.minSize = new Vector2(420f, 520f);
+            // 配置区较高 + 结果表格自带滚动，给足最小高度，避免表格滚动条被挤出窗口底部。
+            window.minSize = new Vector2(460f, 720f);
+            if (window.position.height < 720f)
+            {
+                Rect pos = window.position;
+                pos.height = 820f;
+                window.position = pos;
+            }
         }
 
         protected override void OnEnable()
@@ -298,16 +289,75 @@ namespace UIR.EditorTools
         [ShowIf("@!this.m_isSearching && !string.IsNullOrEmpty(this.m_statusText)")]
         private string StatusText => m_statusText;
 
-        /// <summary>命中结果表格（Odin TableList）。</summary>
-        [Title("结果")]
-        [PropertyOrder(30), ShowInInspector, HideLabel]
-        [TableList(IsReadOnly = true, AlwaysExpanded = true, DrawScrollView = true, MaxScrollViewHeight = 360)]
-        [ShowIf("@this.m_matches.Count > 0")]
-        private List<MatchItem> Results => m_matches;
+        /// <summary>
+        /// 结果区渲染：在 Odin 配置区之后用原生 IMGUI 绘制，独立成一个可滚动列表。
+        /// 之所以不用 Odin TableList：其表格内的滚动条与「定位/打开」按钮在本工程环境下收不到点击。
+        /// 原生 GUILayout 控件是 Unity 最底层的交互，点击与滚动稳定可靠。
+        /// 窗口整体滚动已关闭（UseScrollView=false），配置区固定在顶部，此滚动视图占满剩余高度。
+        /// 检索过程中每命中一张即时追加显示（由 SearchUpdate 每帧 Repaint 驱动），无需等全部结束。
+        /// </summary>
+        protected override void OnEndDrawEditors()
+        {
+            base.OnEndDrawEditors();
 
-        [PropertyOrder(30), ShowInInspector, HideLabel, DisplayAsString]
-        [ShowIf("@this.m_matches.Count == 0 && !this.m_isSearching")]
-        private string EmptyResultHint => "暂无结果。";
+            GUILayout.Space(6f);
+            EditorGUILayout.LabelField(m_isSearching ? $"结果（{m_matches.Count}，搜索中…）" : $"结果（{m_matches.Count}）", EditorStyles.boldLabel);
+
+            if (m_matches.Count == 0)
+            {
+                if (!m_isSearching)
+                {
+                    EditorGUILayout.HelpBox("暂无结果。选择查询图并点击「开始搜索」。", UnityEditor.MessageType.Info);
+                }
+
+                return;
+            }
+
+            // 独立滚动列表：ExpandHeight 占满配置区之下的剩余高度，内容超出即在此区域内滚动。
+            m_resultScroll = GUILayout.BeginScrollView(m_resultScroll, GUILayout.ExpandHeight(true));
+            for (int i = 0; i < m_matches.Count; i++)
+            {
+                DrawMatchRow(m_matches[i]);
+            }
+
+            GUILayout.EndScrollView();
+        }
+
+        /// <summary>绘制单条结果行：缩略图 + 文件名 + 相似度条 + 定位/打开按钮。</summary>
+        private static void DrawMatchRow(MatchItem item)
+        {
+            using (new GUILayout.HorizontalScope(EditorStyles.helpBox))
+            {
+                Rect thumbRect = GUILayoutUtility.GetRect(58f, 58f, GUILayout.Width(58f), GUILayout.Height(58f));
+                if (item.Thumbnail != null)
+                {
+                    GUI.DrawTexture(thumbRect, item.Thumbnail, ScaleMode.ScaleToFit);
+                }
+
+                using (new GUILayout.VerticalScope())
+                {
+                    EditorGUILayout.LabelField(Path.GetFileName(item.FullPath), EditorStyles.boldLabel);
+
+                    Rect barRect = GUILayoutUtility.GetRect(80f, 16f, GUILayout.ExpandWidth(true));
+                    EditorGUI.ProgressBar(barRect, item.Similarity, $"相似度 {item.Similarity:P1}");
+
+                    EditorGUILayout.LabelField(item.FullPath, EditorStyles.miniLabel);
+                }
+
+                using (new GUILayout.VerticalScope(GUILayout.Width(72f)))
+                {
+                    if (GUILayout.Button("定位", GUILayout.Height(24f)))
+                    {
+                        LocateResult(item.FullPath);
+                    }
+
+                    if (GUILayout.Button("打开", GUILayout.Height(24f)))
+                    {
+                        EditorUtility.RevealInFinder(item.FullPath);
+                    }
+                }
+            }
+        }
 
         /// <summary>枚举候选、抽样预估耗时，并弹出确认对话框；确认后启动异步检索。</summary>
         private void PrepareAndConfirmSearch()
@@ -424,8 +474,8 @@ namespace UIR.EditorTools
 
         private void ProcessCandidate(string fullPath)
         {
-            // 跳过查询图自身。
-            if (!string.IsNullOrEmpty(m_querySourcePath) &&
+            // 仅在开启“排除查询图自身”时，跳过与查询图同一路径的文件。
+            if (m_excludeSelf && !string.IsNullOrEmpty(m_querySourcePath) &&
                 string.Equals(Path.GetFullPath(fullPath), m_querySourcePath, StringComparison.OrdinalIgnoreCase))
             {
                 return;
@@ -608,8 +658,9 @@ namespace UIR.EditorTools
         private ulong[] ComputePerceptualHash(Texture source)
         {
             int low = m_highPrecision ? LowFreqHigh : LowFreqNormal;
-            float[] gray = DownscaleToGray(source, HashSampleSize);
-            return PerceptualHashFromGray(gray, HashSampleSize, low);
+            int sample = low * SampleScale; // 采样尺寸随低频块等比放大，保持相同低频带
+            float[] gray = DownscaleToGray(source, sample);
+            return PerceptualHashFromGray(gray, sample, low);
         }
 
         /// <summary>
@@ -698,7 +749,7 @@ namespace UIR.EditorTools
         /// <summary>生成一张 size×size 的缩略图纹理（调用方负责销毁）。</summary>
         private static Texture2D DownscaleToTexture(Texture source, int size)
         {
-            RenderTexture rt = RenderTexture.GetTemporary(size, size, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            RenderTexture rt = RenderTexture.GetTemporary(size, size, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
             RenderTexture prev = RenderTexture.active;
             try
             {
@@ -719,7 +770,8 @@ namespace UIR.EditorTools
 
         private static Color32[] ReadDownscaledPixels(Texture source, int width, int height)
         {
-            RenderTexture rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            // 用 sRGB（gamma）空间读取：pHash 在感知均匀空间上的中间调对比更强，相似/不相似区分更明显。
+            RenderTexture rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
             RenderTexture prev = RenderTexture.active;
             Texture2D tmp = null;
             try
