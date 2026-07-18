@@ -353,7 +353,7 @@ namespace UIR.EditorTools
 
                     if (GUILayout.Button("打开", GUILayout.Height(24f)))
                     {
-                        EditorUtility.RevealInFinder(item.FullPath);
+                        OpenResult(item.FullPath);
                     }
                 }
             }
@@ -403,6 +403,7 @@ namespace UIR.EditorTools
             StartSearch(candidates);
         }
 
+        /// <summary>定位：工程内资源在 Project 面板高亮；工程外文件在资源管理器中选中。</summary>
         private static void LocateResult(string fullPath)
         {
             string assetPath = ToAssetPath(fullPath);
@@ -418,6 +419,24 @@ namespace UIR.EditorTools
             }
 
             EditorUtility.RevealInFinder(fullPath);
+        }
+
+        /// <summary>打开：工程内资源用默认程序打开；工程外文件用系统默认看图程序打开。</summary>
+        private static void OpenResult(string fullPath)
+        {
+            string assetPath = ToAssetPath(fullPath);
+            if (!string.IsNullOrEmpty(assetPath))
+            {
+                UnityEngine.Object obj = AssetDatabase.LoadMainAssetAtPath(assetPath);
+                if (obj != null)
+                {
+                    AssetDatabase.OpenAsset(obj);
+                    return;
+                }
+            }
+
+            // 工程外文件：交给系统默认程序打开图片本身。
+            Application.OpenURL("file:///" + fullPath.Replace('\\', '/'));
         }
 
         // ============================================================
