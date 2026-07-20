@@ -38,5 +38,11 @@ namespace UIR.EditorTools
         {
             ImageSimilaritySearchWindow.Open();
         }
+
+        [MenuItem("UIR/Game 截图", false, 301)]
+        private static void Menu_GameViewScreenshot()
+        {
+            GameViewScreenshotWindow.Open();
+        }
     }
 }
