@@ -1,5 +1,6 @@
 using UnityEditor;
 using UIR.EditorTools.Svn;
+using ComfyUIUpscaler.Editor;
 
 namespace UIR.EditorTools
 {
@@ -43,6 +44,12 @@ namespace UIR.EditorTools
         private static void Menu_GameViewScreenshot()
         {
             GameViewScreenshotWindow.Open();
+        }
+
+        [MenuItem("UIR/ComfyUI 图片批量高清化", false, 302)]
+        private static void Menu_ComfyUIUpscaler()
+        {
+            ComfyUIUpscalerWindow.Open();
         }
     }
 }
