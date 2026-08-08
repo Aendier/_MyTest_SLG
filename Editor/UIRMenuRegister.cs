@@ -44,5 +44,17 @@ namespace UIR.EditorTools
         {
             GameViewScreenshotWindow.Open();
         }
+
+        [MenuItem("UIR/SpriteAtlas 拆分", false, 302)]
+        private static void Menu_SpriteAtlasSplitter()
+        {
+            SpriteAtlasSplitterWindow.Open();
+        }
+
+        [MenuItem("UIR/图片降尺寸", false, 303)]
+        private static void Menu_TextureDownscale()
+        {
+            TextureDownscaleWindow.Open();
+        }
     }
 }

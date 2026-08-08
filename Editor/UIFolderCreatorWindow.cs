@@ -28,7 +28,6 @@ namespace UIR.EditorTools
         // ==================== EditorPrefs 键 ====================
 
         private const string PrefKeySystem = "UIFolderCreator.System";
-        private const string PrefKeyAbbr = "UIFolderCreator.Abbr";
         private const string PrefKeyHierarchy = "UIFolderCreator.Hierarchy";
         private const string PrefKeyHistory = "UIFolderCreator.History";
 
@@ -43,10 +42,7 @@ namespace UIR.EditorTools
         [Tooltip("系统完整名称，例如 RechargeShop，无需输入 UI_ 前缀")]
         private string _systemName = string.Empty;
 
-        [Tooltip("系统缩写，例如 RS，可为空；为空时使用完整系统名")]
-        private string _abbreviation = string.Empty;
-
-        [Tooltip("层级列表，从第二层开始逐层递进拼接")]
+        [Tooltip("层级列表，从第二层开始每层使用各自的纯名字")]
         private readonly List<string> _hierarchy = new List<string> { string.Empty };
 
         /// <summary>最近使用过的系统名历史记录</summary>
@@ -99,7 +95,7 @@ namespace UIR.EditorTools
 
         // ==================== 区域绘制 ====================
 
-        /// <summary>绘制 System Name / Abbreviation / History</summary>
+        /// <summary>绘制 System Name / History</summary>
         private void DrawSystem()
         {
             EditorGUILayout.LabelField("System", EditorStyles.boldLabel);
@@ -107,10 +103,6 @@ namespace UIR.EditorTools
             _systemName = EditorGUILayout.TextField(
                 new GUIContent("System Name", "系统完整名称，例如 RechargeShop（无需输入 UI_）"),
                 _systemName);
-
-            _abbreviation = EditorGUILayout.TextField(
-                new GUIContent("Abbreviation", "系统缩写，例如 RS；为空时使用完整系统名"),
-                _abbreviation);
 
             DrawHistory();
         }
@@ -223,8 +215,8 @@ namespace UIR.EditorTools
         // ==================== 命名逻辑 ====================
 
         /// <summary>
-        /// 依据递进命名规则生成从第一层到最后一层的完整目录名列表
-        /// 规则：第一层固定 UI_完整系统名；第二层 UI_前缀_子名；第三层起在上一层名基础上追加 _子名
+        /// 生成从第一层到最后一层的目录名列表
+        /// 规则：第一层固定 UI_完整系统名；第二层起每层直接使用各自的纯名字
         /// </summary>
         private List<string> GenerateFolderNames()
         {
@@ -237,14 +229,9 @@ namespace UIR.EditorTools
             }
 
             // 第一层：永远为 UI_完整系统名
-            string current = "UI_" + system;
-            result.Add(current);
+            result.Add("UI_" + system);
 
-            // 第二层起使用的前缀：有缩写用缩写，否则用完整系统名
-            string abbr = NormalizeInput(_abbreviation);
-            string prefix = string.IsNullOrEmpty(abbr) ? system : abbr;
-
-            bool first = true;
+            // 第二层起：每层直接使用各自的纯名字，不再累积拼接语义
             foreach (string raw in _hierarchy)
             {
                 string child = NormalizeInput(raw);
@@ -253,19 +240,7 @@ namespace UIR.EditorTools
                     continue;
                 }
 
-                if (first)
-                {
-                    // 第二层重新以前缀拼接
-                    current = "UI_" + prefix + "_" + child;
-                    first = false;
-                }
-                else
-                {
-                    // 第三层起在上一层名称上递进追加
-                    current += "_" + child;
-                }
-
-                result.Add(current);
+                result.Add(child);
             }
 
             return result;
@@ -494,7 +469,6 @@ namespace UIR.EditorTools
         private void LoadPrefs()
         {
             _systemName = EditorPrefs.GetString(PrefKeySystem, string.Empty);
-            _abbreviation = EditorPrefs.GetString(PrefKeyAbbr, string.Empty);
 
             _hierarchy.Clear();
             string hierarchyRaw = EditorPrefs.GetString(PrefKeyHierarchy, string.Empty);
@@ -527,7 +501,6 @@ namespace UIR.EditorTools
         private void SavePrefs()
         {
             EditorPrefs.SetString(PrefKeySystem, _systemName ?? string.Empty);
-            EditorPrefs.SetString(PrefKeyAbbr, _abbreviation ?? string.Empty);
             EditorPrefs.SetString(PrefKeyHierarchy, string.Join(PrefListSeparator.ToString(), _hierarchy));
             EditorPrefs.SetString(PrefKeyHistory, string.Join(PrefListSeparator.ToString(), _history));
         }
