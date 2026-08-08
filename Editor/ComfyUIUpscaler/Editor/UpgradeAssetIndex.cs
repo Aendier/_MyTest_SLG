@@ -228,6 +228,49 @@ namespace ComfyUIUpscaler.Editor
             Save(index);
         }
 
+        // 单资源回滚：清除该资源的成功升级记录并标记为已回滚，使任务面板不再显示为“已升级”
+        public static void MarkAssetRolledBack(string guid, string jobId)
+        {
+            if (string.IsNullOrEmpty(guid))
+                return;
+            UpgradeAssetIndex index = LoadOrRebuild();
+            UpgradeAssetRecord record = index.assets
+                .FirstOrDefault(item => string.Equals(item.guid, guid, StringComparison.Ordinal));
+            if (record == null)
+                return;
+            ClearSuccessfulOutput(record);
+            record.lastAttemptJobId = jobId;
+            record.lastAttemptStatus = JobStatus.RolledBack;
+            record.lastAttemptUtc = DateTime.UtcNow.ToString("O");
+            Save(index);
+        }
+
+        // 批量单资源回滚：一次加载/保存，仅回滚给定 GUID（用于部分恢复，避免逐个落盘卡顿）
+        public static void MarkAssetsRolledBack(IEnumerable<string> guids, string jobId)
+        {
+            if (guids == null)
+                return;
+            var target = new HashSet<string>(
+                guids.Where(guid => !string.IsNullOrEmpty(guid)), StringComparer.Ordinal);
+            if (target.Count == 0)
+                return;
+            UpgradeAssetIndex index = LoadOrRebuild();
+            string now = DateTime.UtcNow.ToString("O");
+            bool changed = false;
+            foreach (UpgradeAssetRecord record in index.assets)
+            {
+                if (record == null || !target.Contains(record.guid))
+                    continue;
+                ClearSuccessfulOutput(record);
+                record.lastAttemptJobId = jobId;
+                record.lastAttemptStatus = JobStatus.RolledBack;
+                record.lastAttemptUtc = now;
+                changed = true;
+            }
+            if (changed)
+                Save(index);
+        }
+
         public static UpgradeAssetIndex RebuildFromManifests()
         {
             var byGuid = new Dictionary<string, UpgradeAssetRecord>(StringComparer.Ordinal);

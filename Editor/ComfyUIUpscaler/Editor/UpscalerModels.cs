@@ -23,6 +23,7 @@ namespace ComfyUIUpscaler.Editor
         public List<AssetReferenceSnapshot> references = new List<AssetReferenceSnapshot>();
 
         [NonSerialized] public string contentSha256;
+        [NonSerialized] public bool skipped;
         [NonSerialized] public UpgradeAssetState upgradeState;
         [NonSerialized] public bool lastAttemptFailed;
         [NonSerialized] public string lastAttemptStatus;
@@ -110,6 +111,8 @@ namespace ComfyUIUpscaler.Editor
         public int requestTimeoutSeconds;
         public int jobTimeoutMinutes;
         public int jpegQuality;
+        // 是否在放大纹理时同步放大 spritePixelsPerUnit，以保持 Sprite 的显示尺寸/九宫格外观不变
+        public bool keepDisplaySize = true;
         public long originalTotalBytes;
         public long outputTotalBytes;
         public List<TextureAssetInfo> assets = new List<TextureAssetInfo>();
@@ -133,6 +136,8 @@ namespace ComfyUIUpscaler.Editor
         public int requestTimeoutSeconds;
         public int jobTimeoutMinutes;
         public int jpegQuality;
+        // 是否在放大纹理时同步放大 spritePixelsPerUnit，以保持 Sprite 显示尺寸不变
+        public bool keepDisplaySize = true;
     }
 
     internal static class JobStatus

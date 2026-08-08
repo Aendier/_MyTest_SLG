@@ -18,6 +18,18 @@ namespace ComfyUIUpscaler.Editor
         public UpscaleJobManifest manifest;
     }
 
+    // 恢复计划：把任务资源分为可安全恢复 / 已变化(跳过) / 缺失备份，并统计将写入的备份体积
+    internal sealed class RestorePlan
+    {
+        public readonly List<TextureAssetInfo> safeAssets = new List<TextureAssetInfo>();
+        public readonly List<TextureAssetInfo> changedAssets = new List<TextureAssetInfo>();
+        public readonly List<string> changedNotes = new List<string>();
+        public readonly List<string> missingNotes = new List<string>();
+        public long safeBytes;        // 安全项将写入的备份总字节
+        public long restorableBytes;  // 安全项 + 变化项（有备份）合计，供“强制恢复”估算
+        public int TotalAssets => safeAssets.Count + changedAssets.Count + missingNotes.Count;
+    }
+
     internal static class UpscaleJobStore
     {
         public static string RootDirectory => Path.Combine(
@@ -51,6 +63,7 @@ namespace ComfyUIUpscaler.Editor
                 requestTimeoutSeconds = settings.requestTimeoutSeconds,
                 jobTimeoutMinutes = settings.jobTimeoutMinutes,
                 jpegQuality = settings.jpegQuality,
+                keepDisplaySize = settings.keepDisplaySize,
                 assets = selectedAssets.ToList()
             };
 
@@ -107,27 +120,6 @@ namespace ComfyUIUpscaler.Editor
                 }
             }
             return records;
-        }
-
-        public static void Restore(string directory)
-        {
-            UpscaleJobManifest manifest = Load(directory);
-            List<string> conflicts = GetRestoreConflicts(manifest);
-            if (conflicts.Count > 0)
-                throw new InvalidOperationException("恢复已阻止：\n" + string.Join("\n", conflicts));
-
-            RestoreFiles(directory, manifest.assets);
-            manifest.status = JobStatus.RolledBack;
-            manifest.completedUtc = DateTime.UtcNow.ToString("O");
-            manifest.log.Add("已从备份恢复原图和 .meta。");
-            Save(directory, manifest);
-            WriteReport(directory, manifest);
-            TryRecordFinalizedJob(manifest);
-        }
-
-        public static List<string> GetRestoreConflicts(string directory)
-        {
-            return GetRestoreConflicts(Load(directory));
         }
 
         // 仅未完成（处理中/已取消/失败）且已生成图集页的任务可以尝试继续
@@ -192,52 +184,6 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
-        private static List<string> GetRestoreConflicts(UpscaleJobManifest manifest)
-        {
-            var conflicts = new List<string>();
-            if (manifest.status != JobStatus.Completed)
-            {
-                conflicts.Add("只有已完成且尚未回滚的任务可以恢复。");
-                return conflicts;
-            }
-
-            var placements = (manifest.pages ?? new List<AtlasPageManifest>())
-                .SelectMany(page => page.placements ?? new List<AtlasPlacement>())
-                .GroupBy(placement => placement.assetPath, StringComparer.Ordinal)
-                .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
-            foreach (TextureAssetInfo asset in manifest.assets)
-            {
-                string currentAssetPath = AssetDatabase.GUIDToAssetPath(asset.guid);
-                if (string.IsNullOrEmpty(currentAssetPath))
-                {
-                    conflicts.Add(asset.assetPath + "：GUID 对应资源不存在");
-                    continue;
-                }
-                if (!placements.TryGetValue(asset.assetPath, out AtlasPlacement placement) ||
-                    string.IsNullOrEmpty(placement.outputSha256) ||
-                    string.IsNullOrEmpty(placement.outputMetaSha256))
-                {
-                    conflicts.Add(currentAssetPath + "：任务缺少输出哈希，无法安全恢复");
-                    continue;
-                }
-
-                string fullPath = TextureScanner.AssetPathToFullPath(currentAssetPath);
-                string metaPath = fullPath + ".meta";
-                if (!File.Exists(fullPath) || !File.Exists(metaPath))
-                {
-                    conflicts.Add(currentAssetPath + "：当前图片或 .meta 不存在");
-                    continue;
-                }
-                if (!string.Equals(UpgradeHashUtility.ComputeFileSha256(fullPath), placement.outputSha256,
-                        StringComparison.OrdinalIgnoreCase))
-                    conflicts.Add(currentAssetPath + "：图片在任务完成后已变化");
-                if (!string.Equals(UpgradeHashUtility.ComputeFileSha256(metaPath), placement.outputMetaSha256,
-                        StringComparison.OrdinalIgnoreCase))
-                    conflicts.Add(currentAssetPath + "：导入设置在任务完成后已变化");
-            }
-            return conflicts;
-        }
-
         public static void RestoreFiles(string directory, IEnumerable<TextureAssetInfo> assets)
         {
             bool editing = false;
@@ -249,9 +195,9 @@ namespace ComfyUIUpscaler.Editor
                 {
                     string currentAssetPath = ResolveCurrentAssetPath(asset);
                     string original = TextureScanner.AssetPathToFullPath(currentAssetPath);
-                    string backup = GetBackupPath(directory, asset.assetPath);
+                    string backup = ResolveBackupFile(directory, asset);
                     string backupMeta = backup + ".meta";
-                    if (!File.Exists(backup) || !File.Exists(backupMeta))
+                    if (string.IsNullOrEmpty(backup) || !File.Exists(backup) || !File.Exists(backupMeta))
                         throw new FileNotFoundException("备份不完整: " + asset.assetPath);
                     Directory.CreateDirectory(Path.GetDirectoryName(original));
                     File.Copy(backup, original, true);
@@ -264,6 +210,181 @@ namespace ComfyUIUpscaler.Editor
                     AssetDatabase.StopAssetEditing();
                 AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
             }
+        }
+
+        // 异步构建恢复计划：对每个资源做哈希比对分类（安全/变化/缺失），时间分片让出主线程并支持取消
+        public static async Task<RestorePlan> BuildRestorePlanAsync(
+            string directory,
+            Action<float, string> progress,
+            CancellationToken cancellationToken)
+        {
+            var plan = new RestorePlan();
+            UpscaleJobManifest manifest = Load(directory);
+            if (manifest == null)
+                return plan;
+
+            var placements = (manifest.pages ?? new List<AtlasPageManifest>())
+                .SelectMany(page => page.placements ?? new List<AtlasPlacement>())
+                .GroupBy(p => p.assetPath, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Last(), StringComparer.Ordinal);
+
+            List<TextureAssetInfo> assets = manifest.assets ?? new List<TextureAssetInfo>();
+            var sliceWatch = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < assets.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ClassifyForRestore(directory, assets[i], placements, plan);
+
+                bool last = i == assets.Count - 1;
+                if (sliceWatch.ElapsedMilliseconds >= 30 || last)
+                {
+                    progress?.Invoke(assets.Count == 0 ? 1f : (float)(i + 1) / assets.Count,
+                        $"校验可恢复项 {i + 1}/{assets.Count}");
+                    if (!last)
+                    {
+                        await Task.Yield();
+                        sliceWatch.Restart();
+                    }
+                }
+            }
+            return plan;
+        }
+
+        // 单资源分类：安全=当前图片/元数据仍与任务输出哈希一致；变化=哈希不符；缺失=GUID/备份/文件缺失
+        private static void ClassifyForRestore(
+            string directory,
+            TextureAssetInfo asset,
+            IReadOnlyDictionary<string, AtlasPlacement> placements,
+            RestorePlan plan)
+        {
+            if (asset == null)
+                return;
+            string currentAssetPath = AssetDatabase.GUIDToAssetPath(asset.guid);
+            if (string.IsNullOrEmpty(currentAssetPath))
+            {
+                plan.missingNotes.Add(asset.assetPath + "：GUID 对应资源不存在");
+                return;
+            }
+
+            string backup = ResolveBackupFile(directory, asset);
+            bool backupOk = !string.IsNullOrEmpty(backup) && File.Exists(backup) && File.Exists(backup + ".meta");
+            long backupBytes = 0;
+            if (backupOk)
+            {
+                try { backupBytes = new FileInfo(backup).Length; } catch { backupBytes = 0; }
+            }
+            if (!backupOk)
+            {
+                plan.missingNotes.Add(currentAssetPath + "：备份不完整，无法恢复");
+                return;
+            }
+
+            void MarkChanged(string note)
+            {
+                plan.changedAssets.Add(asset);
+                plan.changedNotes.Add(note);
+                plan.restorableBytes += backupBytes;
+            }
+
+            if (!placements.TryGetValue(asset.assetPath, out AtlasPlacement placement) ||
+                string.IsNullOrEmpty(placement.outputSha256) || string.IsNullOrEmpty(placement.outputMetaSha256))
+            {
+                MarkChanged(currentAssetPath + "：任务缺少输出哈希，无法确认一致性");
+                return;
+            }
+            string fullPath = TextureScanner.AssetPathToFullPath(currentAssetPath);
+            string metaPath = fullPath + ".meta";
+            if (!File.Exists(fullPath) || !File.Exists(metaPath))
+            {
+                MarkChanged(currentAssetPath + "：当前图片或 .meta 不存在");
+                return;
+            }
+            bool imgMatch = string.Equals(UpgradeHashUtility.ComputeFileSha256(fullPath), placement.outputSha256,
+                StringComparison.OrdinalIgnoreCase);
+            bool metaMatch = string.Equals(UpgradeHashUtility.ComputeFileSha256(metaPath), placement.outputMetaSha256,
+                StringComparison.OrdinalIgnoreCase);
+            if (imgMatch && metaMatch)
+            {
+                plan.safeAssets.Add(asset);
+                plan.safeBytes += backupBytes;
+                plan.restorableBytes += backupBytes;
+            }
+            else
+            {
+                MarkChanged(currentAssetPath + "：任务完成后已变化");
+            }
+        }
+
+        // 异步恢复给定资源：分片复制备份(含 .meta)覆盖原文件，末尾一次性导入；每个成功项在映射表标记已回滚
+        public static async Task<int> RestoreAssetsAsync(
+            string directory,
+            IList<TextureAssetInfo> assets,
+            Action<float, string> progress,
+            CancellationToken cancellationToken)
+        {
+            UpscaleJobManifest manifest = Load(directory);
+            int restored = 0;
+            var restoredGuids = new List<string>();
+            if (assets != null && assets.Count > 0)
+            {
+                var sliceWatch = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < assets.Count; i++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    TextureAssetInfo asset = assets[i];
+                    string backup = ResolveBackupFile(directory, asset);
+                    if (!string.IsNullOrEmpty(backup) && File.Exists(backup) && File.Exists(backup + ".meta"))
+                    {
+                        string currentAssetPath = ResolveCurrentAssetPath(asset);
+                        string original = TextureScanner.AssetPathToFullPath(currentAssetPath);
+                        Directory.CreateDirectory(Path.GetDirectoryName(original));
+                        File.Copy(backup, original, true);
+                        File.Copy(backup + ".meta", original + ".meta", true);
+                        restored++;
+                        if (!string.IsNullOrEmpty(asset.guid))
+                            restoredGuids.Add(asset.guid);
+                    }
+
+                    bool last = i == assets.Count - 1;
+                    if (sliceWatch.ElapsedMilliseconds >= 30 || last)
+                    {
+                        progress?.Invoke(assets.Count == 0 ? 1f : (float)(i + 1) / assets.Count,
+                            $"恢复中 {i + 1}/{assets.Count}");
+                        if (!last)
+                        {
+                            await Task.Yield();
+                            sliceWatch.Restart();
+                        }
+                    }
+                }
+            }
+
+            // 复制完成后一次性触发导入，避免逐张导入卡顿
+            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
+
+            if (manifest != null)
+            {
+                int totalAssets = manifest.assets?.Count ?? 0;
+                manifest.log.Add(DateTime.Now.ToString("HH:mm:ss") +
+                                 $" 恢复完成：已恢复 {restored}/{totalAssets} 个资源（含 .meta）。");
+                if (totalAssets > 0 && restored >= totalAssets)
+                {
+                    // 整任务全部恢复：标记回滚，映射表按 manifest 一次性回滚（避免逐个落盘）
+                    manifest.status = JobStatus.RolledBack;
+                    manifest.completedUtc = DateTime.UtcNow.ToString("O");
+                    Save(directory, manifest);
+                    WriteReport(directory, manifest);
+                    TryRecordFinalizedJob(manifest);
+                }
+                else
+                {
+                    // 部分恢复：保留任务状态以便后续继续，仅把实际恢复的资源批量标记为已回滚
+                    Save(directory, manifest);
+                    WriteReport(directory, manifest);
+                    UpgradeAssetIndexStore.MarkAssetsRolledBack(restoredGuids, manifest.jobId);
+                }
+            }
+            return restored;
         }
 
         public static void WriteReport(string directory, UpscaleJobManifest manifest)
@@ -334,7 +455,7 @@ namespace ComfyUIUpscaler.Editor
                 string meta = source + ".meta";
                 if (!File.Exists(source) || !File.Exists(meta))
                     throw new FileNotFoundException("原图或 .meta 不存在: " + asset.assetPath);
-                string backup = GetBackupPath(directory, asset.assetPath);
+                string backup = GetBackupPath(directory, asset);
                 Directory.CreateDirectory(Path.GetDirectoryName(backup));
                 File.Copy(source, backup, false);
                 File.Copy(meta, backup + ".meta", false);
@@ -349,15 +470,45 @@ namespace ComfyUIUpscaler.Editor
             return string.IsNullOrEmpty(currentPath) ? asset.assetPath : currentPath;
         }
 
-        private static string GetBackupPath(string directory, string assetPath)
+        // 备份文件名改用资源 GUID 短名，避免镜像深层 Assets 路径触发 Windows 260 长路径限制
+        private static string GetBackupPath(string directory, TextureAssetInfo asset)
+        {
+            if (asset == null || string.IsNullOrEmpty(asset.guid))
+                throw new ArgumentException("资源缺少 GUID，无法确定备份路径: " + asset?.assetPath);
+            string root = Path.GetFullPath(Path.Combine(directory, "backup"));
+            string extension = string.IsNullOrEmpty(asset.extension)
+                ? Path.GetExtension(asset.assetPath)
+                : asset.extension;
+            string result = Path.GetFullPath(Path.Combine(root, asset.guid + extension));
+            if (!result.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("备份路径越界: " + asset.assetPath);
+            return result;
+        }
+
+        // 兼容旧任务：旧任务的备份按资源路径镜像存放，读取时可回退到该旧路径
+        private static string GetLegacyBackupPath(string directory, string assetPath)
         {
             if (string.IsNullOrEmpty(assetPath) || !assetPath.StartsWith("Assets/", StringComparison.Ordinal))
-                throw new ArgumentException("非法资源路径: " + assetPath);
+                return string.Empty;
             string root = Path.GetFullPath(Path.Combine(directory, "backup"));
             string result = Path.GetFullPath(Path.Combine(root, assetPath.Replace('/', Path.DirectorySeparatorChar)));
             if (!result.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException("备份路径越界: " + assetPath);
+                return string.Empty;
             return result;
+        }
+
+        // 解析实际存在的备份文件：优先新版 GUID 备份，其次回退旧版镜像备份；均不存在时返回新版路径（调用方需容错）
+        internal static string ResolveBackupFile(string directory, TextureAssetInfo asset)
+        {
+            if (asset == null)
+                return string.Empty;
+            string guidPath = string.IsNullOrEmpty(asset.guid) ? string.Empty : GetBackupPath(directory, asset);
+            if (!string.IsNullOrEmpty(guidPath) && File.Exists(guidPath))
+                return guidPath;
+            string legacy = GetLegacyBackupPath(directory, asset.assetPath);
+            if (!string.IsNullOrEmpty(legacy) && File.Exists(legacy))
+                return legacy;
+            return guidPath;
         }
     }
 
@@ -427,7 +578,8 @@ namespace ComfyUIUpscaler.Editor
                     : fallbackJobTimeoutMinutes,
                 jpegQuality = manifest.jpegQuality > 0
                     ? manifest.jpegQuality
-                    : fallbackJpegQuality
+                    : fallbackJpegQuality,
+                keepDisplaySize = manifest.keepDisplaySize
             };
             ValidateSettings(settings);
             string workflowJson = File.ReadAllText(settings.workflowPath, Encoding.UTF8);
@@ -645,7 +797,7 @@ namespace ComfyUIUpscaler.Editor
                 AssetDatabase.StartAssetEditing();
                 metaEditing = true;
                 foreach (TextureAssetInfo asset in manifest.assets)
-                    ApplySpriteMetadataSettings(asset, placements[asset.assetPath]);
+                    ApplySpriteMetadataSettings(asset, placements[asset.assetPath], manifest.keepDisplaySize);
             }
             finally
             {
@@ -667,7 +819,7 @@ namespace ComfyUIUpscaler.Editor
         }
 
         // 仅设置并保存 Sprite 元数据（不做校验），供批量 SaveAndReimport 使用；校验在批量导入后统一进行
-        private static void ApplySpriteMetadataSettings(TextureAssetInfo info, AtlasPlacement placement)
+        private static void ApplySpriteMetadataSettings(TextureAssetInfo info, AtlasPlacement placement, bool keepDisplaySize)
         {
             var importer = AssetImporter.GetAtPath(info.assetPath) as TextureImporter;
             if (importer == null || importer.textureType != TextureImporterType.Sprite)
@@ -676,6 +828,14 @@ namespace ComfyUIUpscaler.Editor
             // Fractional workflows round each output dimension independently; use the validated actual scales.
             float scaleX = (float)placement.outputWidth / info.width;
             float scaleY = (float)placement.outputHeight / info.height;
+
+            // 保持显示尺寸：纹理放大多少，pixelsPerUnit 就放大多少，使“像素÷ppu”不变（显示尺寸/九宫格外观保持）
+            if (keepDisplaySize)
+            {
+                float ppuScale = (scaleX + scaleY) * 0.5f;
+                if (ppuScale > 0f)
+                    importer.spritePixelsPerUnit *= ppuScale;
+            }
 
             if (importer.spriteImportMode == SpriteImportMode.Single)
             {

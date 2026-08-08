@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Sirenix.OdinInspector;
@@ -40,24 +41,11 @@ namespace ComfyUIUpscaler.Editor
         }
     }
 
-    // ComfyUI 侧内存预估（纯计算）。仅用于提示，不参与实际处理。
+    // ComfyUI 侧尺寸预估（纯计算）。仅用于提示，不参与实际处理。
     internal static class UpscaleMemoryEstimator
     {
-        // float32 RGB 每像素字节数：3 通道 × 4 字节
-        public const int Float32RgbBytesPerPixel = 12;
-
         // Unity Texture2D 单边上限，输出图集超过必然失败
         public const int UnityMaxTextureEdge = 16384;
-
-        // 估算单页在 ComfyUI 侧的峰值张量占用：输入页像素 × 峰值倍率² × 12 字节 × 安全系数
-        public static long EstimatePeakBytes(long maxPagePixels, float peakScale, int safetyFactor)
-        {
-            if (maxPagePixels <= 0 || peakScale <= 0f)
-                return 0;
-            double bytes = (double)maxPagePixels * peakScale * peakScale *
-                           Float32RgbBytesPerPixel * Mathf.Max(1, safetyFactor);
-            return bytes >= long.MaxValue ? long.MaxValue : (long)bytes;
-        }
 
         // 估算最终输出图集单边（用最终倍率），用于判断是否超过 Unity 限制
         public static int EstimateMaxOutputEdge(int maxPageEdge, float finalScale)
@@ -74,7 +62,7 @@ namespace ComfyUIUpscaler.Editor
     {
         private const string PrefPrefix = "ComfyUIUpscaler.";
 
-        // 三块配置各自的盒子标题（用 Odin BoxGroup 分区）
+        // 各配置盒子的标题（用 Odin BoxGroup 分区）
         private const string BoxSource = "路径与扫描";
         private const string BoxComfy = "ComfyUI 连接与工作流";
         private const string BoxAtlas = "图集参数";
@@ -96,17 +84,100 @@ namespace ComfyUIUpscaler.Editor
 
         // ==================== 任务面板 · 路径与扫描 ====================
 
+        // 扫描目录（递归扫描图片）。与“跳过的文件夹”一样用文件夹对象引用（DefaultAsset），可拖拽或点选择器选中
+        private readonly List<DefaultAsset> sourceFolders = new List<DefaultAsset>();
+
+        // 扫描目录与跳过目录并排两列，均为文件夹对象引用；用 IMGUI 手绘以获得并排布局，
+        // 并规避 Odin 列表控件对 Object 引用“点击复制一份引用”的怪异行为
         [BoxGroup(BoxSource)]
         [PropertyOrder(100)]
         [ShowIf(nameof(ShowTaskTab))]
-        [LabelText("扫描目录")]
-        [PropertyTooltip("填入或选择 Assets 下的文件夹（工程相对路径）；非法目录会被自动剔除")]
-        [ShowInInspector]
-        [ListDrawerSettings(ShowFoldout = false, DraggableItems = false)]
-        [FolderPath(RequireExistingPath = true)]
-        [EnableIf(nameof(NotBusy))]
-        [OnValueChanged(nameof(OnFoldersChanged), IncludeChildren = true)]
-        private readonly List<string> sourceFolders = new List<string>();
+        [OnInspectorGUI]
+        private void DrawFolderColumns()
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            using (new EditorGUI.DisabledScope(Busy))
+            {
+                DrawFolderColumn("扫描目录", sourceFolders, OnSourceFoldersChanged,
+                    "拖入或点选择器选择 Assets 下的文件夹；将递归扫描其中图片");
+                GUILayout.Space(6f);
+                DrawFolderColumn("跳过的文件夹（不升级）", skipFolders, OnSkipFoldersChanged,
+                    "这些文件夹（含子目录、以后新增）默认不升级；也可在下方资源表逐行勾选“跳过”");
+            }
+        }
+
+        // 单列文件夹引用编辑：对象字段（点对象可在工程定位）+ 移除按钮 + 添加空槽
+        private void DrawFolderColumn(string title, List<DefaultAsset> list, Action onChanged, string tooltip)
+        {
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                EditorGUILayout.LabelField(new GUIContent(title, tooltip), EditorStyles.miniBoldLabel);
+                int removeIndex = -1;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        EditorGUI.BeginChangeCheck();
+                        var picked = (DefaultAsset)EditorGUILayout.ObjectField(list[i], typeof(DefaultAsset), false);
+                        if (EditorGUI.EndChangeCheck())
+                        {
+                            list[i] = picked;
+                            onChanged();
+                        }
+                        if (GUILayout.Button("−", GUILayout.Width(24f)))
+                            removeIndex = i;
+                    }
+                }
+                if (removeIndex >= 0)
+                {
+                    list.RemoveAt(removeIndex);
+                    onChanged();
+                }
+                if (GUILayout.Button("+ 添加文件夹", GUILayout.Height(20f)))
+                    list.Add(null);
+            }
+        }
+
+        // 从文件夹对象引用列表中提取有效、去重的 Assets 相对路径
+        private static List<string> GetFolderPaths(List<DefaultAsset> folders)
+        {
+            return folders
+                .Where(folder => folder != null)
+                .Select(folder => AssetDatabase.GetAssetPath(folder))
+                .Where(path => !string.IsNullOrEmpty(path) && AssetDatabase.IsValidFolder(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        // 剔除非文件夹的引用，保留空槽（供随后选择）；返回是否有被剔除项
+        private static bool RemoveInvalidFolders(List<DefaultAsset> list)
+        {
+            bool dropped = false;
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                DefaultAsset folder = list[i];
+                if (folder == null)
+                    continue;
+                string path = AssetDatabase.GetAssetPath(folder);
+                if (string.IsNullOrEmpty(path) || !AssetDatabase.IsValidFolder(path))
+                {
+                    list.RemoveAt(i);
+                    dropped = true;
+                }
+            }
+            return dropped;
+        }
+
+        // 扫描目录变更：剔除非文件夹引用、清空旧扫描结果并保存偏好
+        private void OnSourceFoldersChanged()
+        {
+            if (RemoveInvalidFolders(sourceFolders))
+                ShowNotification(new GUIContent("请选择 Assets 下的文件夹"));
+            assets.Clear();
+            RebuildAssetRows();
+            atlasEstimateDirty = true;
+            SavePreferences();
+        }
 
         private void ScanOrCancel()
         {
@@ -134,12 +205,12 @@ namespace ComfyUIUpscaler.Editor
         // ==================== 图集参数（值字段，绘制见 DrawTaskConfig） ====================
 
         private float expectedScale = 4f;
-        private float peakScale = 4f;
         private int padding = 32;
         private int maxAtlasEdge = 4096;
         private long maxAtlasPixels = 16777216;
-        private int memorySafetyFactor = 4;
         private int jpegQuality = 95;
+        // 是否在放大纹理时同步放大 spritePixelsPerUnit（保持 Sprite 显示尺寸/九宫格外观不变）
+        private bool keepDisplaySize = true;
 
         private static readonly int[] AtlasEdgeValues = { 1024, 2048, 4096, 8192 };
         private static readonly string[] AtlasEdgeLabels = { "1024", "2048", "4096", "8192" };
@@ -207,27 +278,59 @@ namespace ComfyUIUpscaler.Editor
                 EditorGUI.BeginChangeCheck();
                 using (new EditorGUILayout.HorizontalScope())
                 {
-                    expectedScale = Mathf.Max(1f, EditorGUILayout.FloatField("预期放大倍率", expectedScale));
-                    peakScale = Mathf.Max(1f, EditorGUILayout.FloatField(
-                        new GUIContent("峰值倍率(内存估算)", "工作流内部的最大放大倍率，仅用于内存预估，不参与实际处理。若模型内部先放大再缩小，请填内部峰值而非最终倍率。"),
-                        peakScale));
-                }
-                using (new EditorGUILayout.HorizontalScope())
-                {
+                    expectedScale = Mathf.Max(1f, EditorGUILayout.FloatField(
+                        new GUIContent("放大倍率", "工作流最终输出相对原图的放大倍率（例如 1.44）。仅用于估算输出尺寸与预警，不改变工作流实际行为。"),
+                        expectedScale));
                     padding = Mathf.Max(0, EditorGUILayout.IntField("Padding", padding));
-                    maxAtlasEdge = EditorGUILayout.IntPopup("最大边长", maxAtlasEdge, AtlasEdgeLabels, AtlasEdgeValues);
                 }
                 using (new EditorGUILayout.HorizontalScope())
                 {
+                    maxAtlasEdge = EditorGUILayout.IntPopup("最大边长", maxAtlasEdge, AtlasEdgeLabels, AtlasEdgeValues);
                     maxAtlasPixels = Math.Max(4096L, EditorGUILayout.LongField("最大像素数", maxAtlasPixels));
-                    memorySafetyFactor = Mathf.Clamp(EditorGUILayout.IntField(
-                        new GUIContent("内存安全系数", "并发中间张量份数的经验系数，仅用于内存预估，越大越保守（建议 3~6）。"),
-                        memorySafetyFactor), 1, 16);
                 }
                 jpegQuality = EditorGUILayout.IntSlider("JPG 质量", jpegQuality, 1, 100);
+                keepDisplaySize = EditorGUILayout.ToggleLeft(
+                    new GUIContent("保持显示尺寸（同步放大 PPU）",
+                        "开启：放大纹理时同步放大 spritePixelsPerUnit，Sprite 的显示尺寸/九宫格外观不变，仅更清晰（推荐，避免受 Layout/原生尺寸控制的图片变大变形）。\n关闭：仅放大纹理，Sprite 逻辑尺寸随之变大（适合整体提升 UI 分辨率的场景）。"),
+                    keepDisplaySize);
                 if (EditorGUI.EndChangeCheck())
                     MarkEstimateDirty();
             }
+        }
+
+        // ==================== 跳过标记（不升级） ====================
+
+        // 被标记为“不升级”的文件夹（递归，含以后新增的资源）。UI 与“扫描目录”并排绘制（见 DrawFolderColumns），
+        // 用文件夹对象引用（DefaultAsset）；存储层保存路径字符串，OnEnable/变更时双向转换。
+        private readonly List<DefaultAsset> skipFolders = new List<DefaultAsset>();
+
+        // 跳过文件夹变更后：剔除非文件夹引用，把有效文件夹路径去重写回存储并重算跳过标记
+        private void OnSkipFoldersChanged()
+        {
+            if (RemoveInvalidFolders(skipFolders))
+                ShowNotification(new GUIContent("请选择 Assets 下的文件夹"));
+            UpscaleSkipStore.SetFolders(GetFolderPaths(skipFolders));
+            ReapplySkipMarks();
+        }
+
+        // 依据存储重算 skipped 标记：被标记的资源取消勾选并重建资源表
+        private void ReapplySkipMarks()
+        {
+            UpscaleSkipStore.ApplyToAssets(assets);
+            foreach (TextureAssetInfo asset in assets)
+                if (asset.skipped)
+                    asset.selected = false;
+            RebuildAssetRows();
+            atlasEstimateDirty = true;
+            SafeRepaint();
+        }
+
+        // 逐行“跳过”开关触发：延迟到下一帧重建表格（避免绘制表格时修改集合），并刷新预估
+        private void OnSkipToggled()
+        {
+            assetRowsDirty = true;
+            atlasEstimateDirty = true;
+            SafeRepaint();
         }
 
         // ==================== 待处理资源 ====================
@@ -236,7 +339,7 @@ namespace ComfyUIUpscaler.Editor
             { "全部状态", "未升级", "已升级", "已变化", "上次失败", "已回滚" };
 
         private string AssetSummary =>
-            $"已选 {assets.Count(asset => asset.selected)}/{assets.Count}，筛选后 {filteredAssets.Count}";
+            $"已选 {assets.Count(asset => asset.selected)}/{assets.Count}，筛选后 {filteredAssets.Count}，已跳过 {assets.Count(asset => asset.skipped)}";
 
         private UpgradeAssetFilter assetUpgradeFilter = UpgradeAssetFilter.All;
 
@@ -246,11 +349,18 @@ namespace ComfyUIUpscaler.Editor
         [OnInspectorGUI]
         private void DrawAssetToolbar()
         {
+            // 逐行“跳过”开关会请求延迟重建，这里在绘制表格前统一重建，避免在表格绘制过程中修改集合
+            if (assetRowsDirty)
+            {
+                assetRowsDirty = false;
+                RebuildAssetRows();
+            }
+
             EditorGUILayout.LabelField("待处理资源", EditorStyles.boldLabel);
             using (new EditorGUILayout.HorizontalScope())
             using (new EditorGUI.DisabledScope(Busy))
             {
-                EditorGUILayout.LabelField(AssetSummary, GUILayout.MinWidth(180f));
+                EditorGUILayout.LabelField(AssetSummary, GUILayout.MinWidth(220f));
                 GUILayout.Label("状态", GUILayout.Width(30f));
                 EditorGUI.BeginChangeCheck();
                 int updated = EditorGUILayout.Popup((int)assetUpgradeFilter, UpgradeFilterLabels, GUILayout.Width(90f));
@@ -259,6 +369,11 @@ namespace ComfyUIUpscaler.Editor
                     assetUpgradeFilter = (UpgradeAssetFilter)updated;
                     OnFilterChanged();
                 }
+                GUILayout.Space(8f);
+                EditorGUI.BeginChangeCheck();
+                hideSkipped = GUILayout.Toggle(hideSkipped, "隐藏已跳过", GUILayout.Width(90f));
+                if (EditorGUI.EndChangeCheck())
+                    RebuildAssetRows();
                 GUILayout.FlexibleSpace();
                 if (GUILayout.Button("全选", GUILayout.Width(60f)))
                     SelectAll();
@@ -271,9 +386,11 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
-        private void SelectAll() => SetFilteredSelection(_ => true);
+        // 批量选择均跳过被标记为“不升级”的资源
+        private void SelectAll() => SetFilteredSelection(asset => !asset.skipped);
 
-        private void SelectSafeOnly() => SetFilteredSelection(asset => string.IsNullOrEmpty(asset.warning));
+        private void SelectSafeOnly() =>
+            SetFilteredSelection(asset => !asset.skipped && string.IsNullOrEmpty(asset.warning));
 
         private void DeselectUpgraded() =>
             SetFilteredSelection(asset => asset.upgradeState != UpgradeAssetState.Upgraded && asset.selected);
@@ -305,17 +422,16 @@ namespace ComfyUIUpscaler.Editor
                 : "参数错误: " + atlasEstimateError;
             EditorGUILayout.LabelField(estimate);
 
-            // 内存预估与显存提示（仅通知，不阻止执行）
-            long peakBytes = UpscaleMemoryEstimator.EstimatePeakBytes(estimatedMaxPagePixels, peakScale, memorySafetyFactor);
+            // 显存：实测优先（运行时持续采样），无需再手填峰值倍率
             int outputEdge = UpscaleMemoryEstimator.EstimateMaxOutputEdge(estimatedMaxPageEdge, expectedScale);
-            string peakText = estimatedMaxPagePixels > 0
-                ? $"单页峰值≈{UpscaleJobStore.FormatBytes(peakBytes)}（{peakScale:0.##}x² × k{memorySafetyFactor}）"
-                : "单页峰值：未选择资源";
             string budgetText = memBudgetKnown
                 ? $"可用显存 {UpscaleJobStore.FormatBytes(vramFreeBytes)}/{UpscaleJobStore.FormatBytes(vramTotalBytes)}（{memDeviceName}）"
                 : "可用显存未知（点“测试连接”或“刷新显存”）";
-            EditorGUILayout.LabelField(peakText + "｜" + budgetText);
-            foreach (string warning in BuildMemoryWarnings(peakBytes, outputEdge))
+            string usedText = observedPeakUsedBytes > 0
+                ? $"｜实测占用峰值≈{UpscaleJobStore.FormatBytes(observedPeakUsedBytes)}"
+                : string.Empty;
+            EditorGUILayout.LabelField(budgetText + usedText);
+            foreach (string warning in BuildMemoryWarnings(outputEdge))
                 EditorGUILayout.HelpBox(warning, MessageType.Warning);
 
             Rect progressRect = EditorGUILayout.GetControlRect(false, 20f);
@@ -360,21 +476,39 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
-        // ==================== 历史记录页签 ====================
+        // ==================== 历史记录页签（左任务列表 + 右详情） ====================
+
+        private static readonly string[] HistoryFilterLabels =
+            { "全部", "已完成", "失败", "已取消", "已回滚", "进行中" };
+
+        // 历史左右两栏滚动区高度：随窗口高度自适应填满整页（减去上方页签/标题/筛选等固定占用）。
+        // 用常量偏移而非布局测量，避免 IMGUI 在 Layout/Repaint 两阶段高度不一致报错。
+        // 历史面板上半区（任务列表/任务详情）高度：固定占比，余下空间留给下方整页资源表
+        private float HistoryTopHeight => Mathf.Clamp(position.height * 0.34f, 200f, 320f);
 
         [PropertyOrder(600)]
         [ShowIf(nameof(ShowHistoryTab))]
         [OnInspectorGUI]
-        private void DrawHistoryHeader()
+        private void DrawHistory()
         {
             EditorGUILayout.LabelField("历史任务与恢复", EditorStyles.boldLabel);
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("打开映射", GUILayout.Width(90f)))
-                    OpenIndexMap();
+                GUILayout.Label("状态", GUILayout.Width(30f));
+                historyFilter = (HistoryFilter)EditorGUILayout.Popup((int)historyFilter, HistoryFilterLabels, GUILayout.Width(90f));
+                GUILayout.FlexibleSpace();
                 if (GUILayout.Button("刷新", GUILayout.Width(70f)))
                     RefreshJobs();
-                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("打开映射", GUILayout.Width(90f)))
+                    OpenIndexMap();
+            }
+            EditorGUILayout.Space(2f);
+
+            List<JobRecord> visible = FilterJobs();
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                DrawHistoryList(visible);
+                DrawHistoryDetail(visible);
             }
         }
 
@@ -386,12 +520,251 @@ namespace ComfyUIUpscaler.Editor
                 ShowNotification(new GUIContent("映射表尚未生成"));
         }
 
-        [PropertyOrder(610)]
-        [ShowIf(nameof(ShowHistoryTab))]
-        [ShowInInspector]
-        [TableList(IsReadOnly = true, AlwaysExpanded = true, HideToolbar = true)]
-        [HideLabel]
-        private List<HistoryRow> historyRows = new List<HistoryRow>();
+        // 依状态筛选左侧任务列表；“进行中”覆盖新建/处理中/待提交三种未完结状态
+        private List<JobRecord> FilterJobs()
+        {
+            switch (historyFilter)
+            {
+                case HistoryFilter.Completed:
+                    return jobs.Where(job => job.manifest.status == JobStatus.Completed).ToList();
+                case HistoryFilter.Failed:
+                    return jobs.Where(job => job.manifest.status == JobStatus.Failed).ToList();
+                case HistoryFilter.Canceled:
+                    return jobs.Where(job => job.manifest.status == JobStatus.Canceled).ToList();
+                case HistoryFilter.RolledBack:
+                    return jobs.Where(job => job.manifest.status == JobStatus.RolledBack).ToList();
+                case HistoryFilter.Processing:
+                    return jobs.Where(job =>
+                        job.manifest.status == JobStatus.Created ||
+                        job.manifest.status == JobStatus.Processing ||
+                        job.manifest.status == JobStatus.ReadyToCommit).ToList();
+                default:
+                    return jobs;
+            }
+        }
+
+        // 左侧任务列表：每条为可点击条目，选中项高亮
+        private void DrawHistoryList(List<JobRecord> visible)
+        {
+            using (new EditorGUILayout.VerticalScope(GUILayout.Width(320f)))
+            {
+                EditorGUILayout.LabelField($"任务列表（{visible.Count}）", EditorStyles.miniBoldLabel);
+                // 左侧比右侧多一行标题，减去其高度以对齐两栏底部
+                historyListScroll = EditorGUILayout.BeginScrollView(
+                    historyListScroll, EditorStyles.helpBox, GUILayout.Height(HistoryTopHeight - 20f));
+                if (visible.Count == 0)
+                    EditorGUILayout.LabelField("暂无记录", EditorStyles.miniLabel);
+                foreach (JobRecord job in visible)
+                {
+                    bool isSelected = job.manifest.jobId == selectedJobId;
+                    string title = $"{job.manifest.status}｜{job.manifest.jobId}\n" +
+                                   $"{UpgradeAssetStateUtility.GetLocalDate(job.manifest.createdUtc)} · " +
+                                   $"{job.manifest.assets.Count} 文件 / {job.manifest.pages.Count} 页";
+                    Color previous = GUI.backgroundColor;
+                    if (isSelected)
+                        GUI.backgroundColor = new Color(0.45f, 0.7f, 1f);
+                    if (GUILayout.Button(title, HistoryEntryStyle, GUILayout.Height(42f)))
+                        SelectJob(job);
+                    GUI.backgroundColor = previous;
+                }
+                EditorGUILayout.EndScrollView();
+            }
+        }
+
+        // 右侧任务详情（仅详情与操作按钮）；被修改资源表已下移为整页 Odin 表格
+        private void DrawHistoryDetail(List<JobRecord> visible)
+        {
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                historyDetailScroll = EditorGUILayout.BeginScrollView(historyDetailScroll, GUILayout.Height(HistoryTopHeight));
+                JobRecord job = jobs.FirstOrDefault(record => record.manifest.jobId == selectedJobId);
+                if (job == null)
+                {
+                    EditorGUILayout.LabelField("请选择左侧任务查看详情", EditorStyles.miniLabel);
+                }
+                else
+                {
+                    EnsureDetailRows(job);
+                    DrawJobDetailTop(job);
+                }
+                EditorGUILayout.EndScrollView();
+            }
+        }
+
+        private void DrawJobDetailTop(JobRecord job)
+        {
+            UpscaleJobManifest manifest = job.manifest;
+            EditorGUILayout.LabelField("任务详情", EditorStyles.boldLabel);
+            DrawKeyValue("任务 ID", manifest.jobId);
+            DrawKeyValue("状态", manifest.status);
+            DrawKeyValue("创建时间", UpgradeAssetStateUtility.GetLocalDate(manifest.createdUtc));
+            if (!string.IsNullOrEmpty(manifest.completedUtc))
+                DrawKeyValue("完成时间", UpgradeAssetStateUtility.GetLocalDate(manifest.completedUtc));
+            DrawKeyValue("规模", $"{manifest.assets.Count} 文件 / {manifest.pages.Count} 页");
+            DrawKeyValue("大小变化", UpscaleJobStore.FormatSizeSummary(manifest));
+            DrawKeyValue("预期倍率", $"{manifest.expectedScale:0.##}x");
+            DrawKeyValue("工作流", string.IsNullOrEmpty(manifest.workflowPath)
+                ? "-"
+                : Path.GetFileName(manifest.workflowPath));
+            if (!string.IsNullOrEmpty(manifest.workflowSha256))
+                DrawKeyValue("工作流 SHA", manifest.workflowSha256.Length > 16
+                    ? manifest.workflowSha256.Substring(0, 16) + "…"
+                    : manifest.workflowSha256);
+            if (!string.IsNullOrEmpty(manifest.error))
+                EditorGUILayout.HelpBox(manifest.error, MessageType.Error);
+
+            using (new EditorGUILayout.HorizontalScope())
+            using (new EditorGUI.DisabledScope(Busy))
+            {
+                using (new EditorGUI.DisabledScope(!UpscaleJobStore.CanAttemptResume(manifest)))
+                {
+                    if (GUILayout.Button(new GUIContent("继续", "从中断处继续，已完成的图集页不会重跑"), GUILayout.Height(24f)))
+                        Resume(job);
+                }
+                using (new EditorGUI.DisabledScope(manifest.status != JobStatus.Completed))
+                {
+                    if (GUILayout.Button(new GUIContent("恢复", "仅已完成且当前文件未变化的任务可恢复"), GUILayout.Height(24f)))
+                        Restore(job);
+                }
+                if (GUILayout.Button("打开目录", GUILayout.Height(24f)))
+                    EditorUtility.RevealInFinder(job.directory);
+                GUILayout.FlexibleSpace();
+            }
+
+            // 恢复进行中：显示进度条与中断按钮（复制阶段可中断，末尾导入不可中断）
+            if (restoring)
+            {
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    Rect barRect = GUILayoutUtility.GetRect(100f, 18f, GUILayout.ExpandWidth(true));
+                    EditorGUI.ProgressBar(barRect, progress, status);
+                    if (GUILayout.Button("中断", GUILayout.Width(60f), GUILayout.Height(18f)))
+                        restoreCancellation?.Cancel();
+                }
+            }
+        }
+
+        // 单资源恢复：用该任务备份覆盖当前资源与 .meta，并把该资源在映射表中标记为已回滚
+        private void RestoreSingleAsset(JobRecord job, DetailRow row)
+        {
+            try
+            {
+                if (!EditorUtility.DisplayDialog(
+                        "恢复该资源",
+                        $"将用任务 {job.manifest.jobId} 的备份覆盖以下资源（含 .meta）：\n\n{row.assetPath}\n\n恢复后该资源标记为“已回滚”。",
+                        "恢复",
+                        "取消"))
+                    return;
+
+                var target = new TextureAssetInfo { assetPath = row.assetPath, guid = row.guid };
+                UpscaleJobStore.RestoreFiles(job.directory, new[] { target });
+                UpgradeAssetIndexStore.MarkAssetRolledBack(row.guid, job.manifest.jobId);
+                status = "已恢复资源: " + row.assetPath;
+                if (assets.Count > 0)
+                    RefreshAssetUpgradeStates();
+                PingAsset(row.guid, row.assetPath);
+            }
+            catch (Exception exception)
+            {
+                status = "恢复失败: " + exception.Message;
+                EditorUtility.DisplayDialog("恢复失败", exception.Message, "确定");
+            }
+        }
+
+        private static void DrawKeyValue(string key, string value)
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField(key, GUILayout.Width(90f));
+                EditorGUILayout.SelectableLabel(value ?? "-", GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            }
+        }
+
+        private void SelectJob(JobRecord job)
+        {
+            selectedJobId = job.manifest.jobId;
+            EnsureDetailRows(job);
+            GUI.FocusControl(null);
+        }
+
+        // 定位资源：优先按 GUID 解析当前路径（兼容移动/改名），成功则 ping 并选中
+        private void PingAsset(string guid, string assetPath)
+        {
+            string path = string.IsNullOrEmpty(guid) ? null : AssetDatabase.GUIDToAssetPath(guid);
+            if (string.IsNullOrEmpty(path))
+                path = assetPath;
+            UnityEngine.Object target = string.IsNullOrEmpty(path)
+                ? null
+                : AssetDatabase.LoadMainAssetAtPath(path);
+            if (target != null)
+            {
+                EditorGUIUtility.PingObject(target);
+                Selection.activeObject = target;
+            }
+            else
+            {
+                ShowNotification(new GUIContent("资源不存在或已移动"));
+            }
+        }
+
+        // 按需构建并缓存所选任务的资源明细：后尺寸/倍率取 placements，前后字节读备份与暂存文件
+        private void EnsureDetailRows(JobRecord job)
+        {
+            if (job == null)
+                return;
+            if (detailRowsJobId == job.manifest.jobId && detailRows != null)
+                return;
+            detailRowsJobId = job.manifest.jobId;
+            detailRows = BuildDetailRows(job);
+        }
+
+        private List<DetailRow> BuildDetailRows(JobRecord job)
+        {
+            var rows = new List<DetailRow>();
+            UpscaleJobManifest manifest = job.manifest;
+            var placements = (manifest.pages ?? new List<AtlasPageManifest>())
+                .SelectMany(page => page.placements ?? new List<AtlasPlacement>())
+                .GroupBy(placement => placement.assetPath, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
+            foreach (TextureAssetInfo asset in manifest.assets ?? new List<TextureAssetInfo>())
+            {
+                if (asset == null)
+                    continue;
+                var row = new DetailRow(this, job)
+                {
+                    assetPath = asset.assetPath,
+                    guid = asset.guid,
+                    beforeWidth = asset.width,
+                    beforeHeight = asset.height,
+                    // 备份文件名已改用 GUID 短名，读取时按新/旧路径回退解析
+                    beforeBytes = TryFileSize(UpscaleJobStore.ResolveBackupFile(job.directory, asset))
+                };
+                if (placements.TryGetValue(asset.assetPath ?? string.Empty, out AtlasPlacement placement))
+                {
+                    row.afterWidth = placement.outputWidth;
+                    row.afterHeight = placement.outputHeight;
+                    row.scale = placement.scale;
+                    if (!string.IsNullOrEmpty(placement.stagedFile))
+                        row.afterBytes = TryFileSize(Path.Combine(job.directory, placement.stagedFile));
+                }
+                rows.Add(row);
+            }
+            return rows;
+        }
+
+        private static long TryFileSize(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                    return new FileInfo(path).Length;
+            }
+            catch
+            {
+                // 读取文件大小失败时按未知(0)处理，不影响其余展示
+            }
+            return 0;
+        }
 
         // ==================== 运行时状态（不参与绘制） ====================
 
@@ -399,9 +772,40 @@ namespace ComfyUIUpscaler.Editor
         private readonly List<TextureAssetInfo> filteredAssets = new List<TextureAssetInfo>();
         private List<JobRecord> jobs = new List<JobRecord>();
         private readonly List<string> liveLog = new List<string>();
+
+        // 任务面板：跳过标记相关运行态
+        private bool hideSkipped;
+        private bool assetRowsDirty;
+
+        // 历史页签：状态筛选、选中任务与资源明细缓存
+        private enum HistoryFilter { All, Completed, Failed, Canceled, RolledBack, Processing }
+        private HistoryFilter historyFilter = HistoryFilter.All;
+        private string selectedJobId = string.Empty;
+        private Vector2 historyListScroll;
+        private Vector2 historyDetailScroll;
+        // 被修改资源表：与任务面板资源表一致，使用 Odin 原生 [Searchable]+[TableList] 分页（固定每页 25 条）
+        [PropertyOrder(610)]
+        [ShowIf(nameof(ShowHistoryDetailTable))]
+        [Title("$DetailTableTitle")]
+        [Searchable]
+        [TableList(IsReadOnly = true, AlwaysExpanded = true, ShowPaging = true, NumberOfItemsPerPage = 25)]
+        [HideLabel]
+        [ShowInInspector]
+        private List<DetailRow> detailRows;
+        private string detailRowsJobId = string.Empty;
+
+        private bool ShowHistoryDetailTable => ShowHistoryTab && detailRows != null && detailRows.Count > 0;
+        private string DetailTableTitle => $"被修改的资源（{detailRows?.Count ?? 0}）";
+        private GUIStyle historyEntryStyle;
+        private GUIStyle HistoryEntryStyle => historyEntryStyle ??= new GUIStyle(GUI.skin.button)
+        {
+            alignment = TextAnchor.MiddleLeft,
+            wordWrap = true,
+            padding = new RectOffset(8, 8, 4, 4),
+            fontSize = 11
+        };
         private bool atlasEstimateDirty = true;
         private int estimatedAtlasPages;
-        private long estimatedMaxPagePixels;
         private int estimatedMaxPageEdge;
         private string atlasEstimateError = string.Empty;
         private bool memBudgetKnown;
@@ -409,6 +813,10 @@ namespace ComfyUIUpscaler.Editor
         private long vramFreeBytes;
         private long vramTotalBytes;
         private string memDeviceName = string.Empty;
+        // 运行期间显存实测：持续采样，记录占用峰值并在接近上限时提醒（替代原“峰值倍率/安全系数”手填估算）
+        private long observedPeakUsedBytes;
+        private bool memWarnedHigh;
+        private CancellationTokenSource memMonitorCancellation;
         private Vector2 logScroll;
         private bool running;
         private bool scanning;
@@ -418,9 +826,11 @@ namespace ComfyUIUpscaler.Editor
         private CancellationTokenSource runCancellation;
         private CancellationTokenSource connectionCancellation;
         private CancellationTokenSource scanCancellation;
+        private bool restoring;
+        private CancellationTokenSource restoreCancellation;
 
-        // 运行或扫描期间都视为忙碌，统一禁用配置编辑与开始操作
-        private bool Busy => running || scanning;
+        // 运行、扫描或恢复期间都视为忙碌，统一禁用配置编辑与开始操作
+        private bool Busy => running || scanning || restoring;
         private bool NotBusy => !Busy;
         private bool CanStart => !Busy && assets.Any(asset => asset.selected);
         private bool CanTestConnection => !Busy && !testingConnection;
@@ -442,6 +852,14 @@ namespace ComfyUIUpscaler.Editor
         {
             base.OnEnable();
             LoadPreferences();
+            // 存储的是路径字符串，UI 用文件夹对象引用，这里把有效文件夹加载为 DefaultAsset
+            skipFolders.Clear();
+            foreach (string path in UpscaleSkipStore.GetFolders())
+            {
+                var folder = AssetDatabase.LoadAssetAtPath<DefaultAsset>(path);
+                if (folder != null)
+                    skipFolders.Add(folder);
+            }
             RefreshJobs();
             RebuildAssetRows();
         }
@@ -453,6 +871,9 @@ namespace ComfyUIUpscaler.Editor
                 runCancellation?.Cancel();
             if (scanning)
                 scanCancellation?.Cancel();
+            if (restoring)
+                restoreCancellation?.Cancel();
+            memMonitorCancellation?.Cancel();
             SavePreferences();
             base.OnDisable();
         }
@@ -465,9 +886,7 @@ namespace ComfyUIUpscaler.Editor
             if (scanning)
                 return;
 
-            List<string> configuredFolders = sourceFolders
-                .Where(path => !string.IsNullOrWhiteSpace(path))
-                .ToList();
+            List<string> configuredFolders = GetFolderPaths(sourceFolders);
             if (configuredFolders.Count == 0)
             {
                 EditorUtility.DisplayDialog("扫描失败", "请至少选择一个 Assets 下的目录。", "确定");
@@ -556,12 +975,11 @@ namespace ComfyUIUpscaler.Editor
             }
             int pageCount = pages.Count;
 
-            // 开始前尽力刷新显存并计算内存风险提示（仅通知，不阻止）
-            (long maxPagePixels, int maxPageEdge) = GetLargestPage(pages);
+            // 开始前尽力刷新显存并做确定性的输出尺寸检查（仅通知，不阻止）
+            (_, int maxPageEdge) = GetLargestPage(pages);
             await FetchMemoryBudgetAsync();
-            long peakBytes = UpscaleMemoryEstimator.EstimatePeakBytes(maxPagePixels, peakScale, memorySafetyFactor);
             int outputEdge = UpscaleMemoryEstimator.EstimateMaxOutputEdge(maxPageEdge, expectedScale);
-            List<string> memoryWarnings = BuildMemoryWarnings(peakBytes, outputEdge);
+            List<string> memoryWarnings = BuildMemoryWarnings(outputEdge);
 
             int riskyCount = assets.Count(asset => asset.selected && !string.IsNullOrEmpty(asset.warning));
             string confirmation = $"将处理 {selectedCount} 个文件，预计生成 {pageCount} 张图集，并在全部校验成功后覆盖原图。";
@@ -578,6 +996,7 @@ namespace ComfyUIUpscaler.Editor
             status = "准备任务";
             running = true;
             runCancellation = new CancellationTokenSource();
+            StartMemoryMonitor();
             try
             {
                 UpscaleJobManifest result = await UpscaleJobRunner.RunAsync(
@@ -612,6 +1031,7 @@ namespace ComfyUIUpscaler.Editor
             }
             finally
             {
+                StopMemoryMonitor();
                 running = false;
                 runCancellation.Dispose();
                 runCancellation = null;
@@ -645,6 +1065,7 @@ namespace ComfyUIUpscaler.Editor
             status = "准备继续任务";
             running = true;
             runCancellation = new CancellationTokenSource();
+            StartMemoryMonitor();
             try
             {
                 UpscaleJobManifest result = await UpscaleJobRunner.ResumeAsync(
@@ -681,6 +1102,7 @@ namespace ComfyUIUpscaler.Editor
             }
             finally
             {
+                StopMemoryMonitor();
                 running = false;
                 runCancellation.Dispose();
                 runCancellation = null;
@@ -691,46 +1113,203 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
-        private void Restore(JobRecord job)
+        // 整任务恢复：异步校验 → 详细确认（部分/强制/取消）→ 异步执行，全程可中断并显示进度
+        private async void Restore(JobRecord job)
         {
+            if (Busy)
+                return;
+            string directory = job.directory;
+            string jobId = job.manifest.jobId;
+
+            // 阶段一：异步校验，构建恢复计划（逐张哈希比对较重，时间分片 + 可中断）
+            restoring = true;
+            progress = 0f;
+            status = "校验可恢复项…";
+            restoreCancellation = new CancellationTokenSource();
+            RestorePlan plan;
             try
             {
-                List<string> conflicts = UpscaleJobStore.GetRestoreConflicts(job.directory);
-                if (conflicts.Count > 0)
-                {
-                    string details = string.Join("\n", conflicts.Take(8));
-                    if (conflicts.Count > 8)
-                        details += $"\n……另有 {conflicts.Count - 8} 项";
-                    EditorUtility.DisplayDialog(
-                        "恢复已阻止",
-                        "任务完成后有文件或导入设置发生变化：\n\n" + details,
-                        "确定");
-                    return;
-                }
-
-                string message = $"已确认当前文件仍与任务输出一致。将使用任务 {job.manifest.jobId} 的备份覆盖 " +
-                                 $"{job.manifest.assets.Count} 个原文件及其 .meta。";
-                if (!EditorUtility.DisplayDialog("恢复任务", message, "恢复", "取消"))
-                    return;
-
-                UpscaleJobStore.Restore(job.directory);
-                status = "已恢复: " + job.manifest.jobId;
-                RefreshJobs();
-                _ = ScanAsync();
+                plan = await UpscaleJobStore.BuildRestorePlanAsync(
+                    directory,
+                    (value, message) =>
+                    {
+                        progress = value;
+                        status = message;
+                        SafeRepaint();
+                    },
+                    restoreCancellation.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                status = "恢复校验已取消";
+                FinishRestore();
+                return;
             }
             catch (Exception exception)
             {
-                status = "恢复失败";
+                status = "恢复校验失败: " + exception.Message;
+                Debug.LogException(exception);
+                FinishRestore();
+                EditorUtility.DisplayDialog("恢复失败", exception.Message, "确定");
+                return;
+            }
+
+            if (plan.TotalAssets == 0)
+            {
+                status = "该任务没有可恢复的资源";
+                FinishRestore();
+                EditorUtility.DisplayDialog("无法恢复", "该任务没有记录任何资源。", "确定");
+                return;
+            }
+
+            // 阶段二：详细确认框（数量 / 体积 / 安全vs变化 / 粗估时间 / 部分或强制）
+            int safe = plan.safeAssets.Count;
+            int changed = plan.changedAssets.Count;
+            int missing = plan.missingNotes.Count;
+            bool force = false;
+            List<TextureAssetInfo> targets;
+
+            if (changed == 0 && missing == 0)
+            {
+                string message = $"任务 {jobId}\n\n" +
+                                 $"将用备份覆盖 {safe} 个资源（含 .meta），写入体积约 {UpscaleJobStore.FormatBytes(plan.safeBytes)}。\n" +
+                                 EstimateRestoreTimeHint(safe) + "\n\n" +
+                                 "恢复后这些资源标记为“已回滚”，操作可中断。";
+                if (!EditorUtility.DisplayDialog("恢复任务", message, "开始恢复", "取消"))
+                {
+                    status = "已取消恢复";
+                    FinishRestore();
+                    return;
+                }
+                targets = plan.safeAssets;
+            }
+            else
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine($"任务 {jobId} 校验结果：");
+                sb.AppendLine($"· 可安全恢复：{safe} 个（约 {UpscaleJobStore.FormatBytes(plan.safeBytes)}）");
+                if (changed > 0)
+                    sb.AppendLine($"· 任务完成后已变化：{changed} 个（默认跳过，避免覆盖你的新改动）");
+                if (missing > 0)
+                    sb.AppendLine($"· 备份缺失/无法恢复：{missing} 个（始终跳过）");
+                sb.AppendLine();
+                sb.AppendLine(EstimateRestoreTimeHint(safe));
+                sb.AppendLine();
+                sb.AppendLine("“恢复安全项”：仅恢复未变化的资源。");
+
+                if (changed > 0)
+                {
+                    sb.AppendLine($"“强制全部恢复”：连同 {changed} 个已变化项一并用备份覆盖" +
+                                  $"（丢弃这些改动，约 {UpscaleJobStore.FormatBytes(plan.restorableBytes)}）。");
+                    // 返回值：0=第一个(恢复安全项)，1=第二个(取消)，2=第三个(强制全部恢复)
+                    int choice = EditorUtility.DisplayDialogComplex(
+                        "恢复任务", sb.ToString(), "恢复安全项", "取消", "强制全部恢复");
+                    if (choice == 1)
+                    {
+                        status = "已取消恢复";
+                        FinishRestore();
+                        return;
+                    }
+                    if (choice == 2)
+                    {
+                        force = true;
+                        targets = new List<TextureAssetInfo>(plan.safeAssets);
+                        targets.AddRange(plan.changedAssets);
+                    }
+                    else
+                    {
+                        targets = plan.safeAssets;
+                    }
+                }
+                else
+                {
+                    // 只有缺失备份的项无法恢复，其余均安全：两按钮确认即可
+                    if (!EditorUtility.DisplayDialog("恢复任务", sb.ToString(), "恢复安全项", "取消"))
+                    {
+                        status = "已取消恢复";
+                        FinishRestore();
+                        return;
+                    }
+                    targets = plan.safeAssets;
+                }
+            }
+
+            if (targets.Count == 0)
+            {
+                status = "没有可安全恢复的资源";
+                FinishRestore();
+                EditorUtility.DisplayDialog(
+                    "无可恢复项",
+                    "没有可安全恢复的资源。如需覆盖已改动的资源，请选择“强制全部恢复”。",
+                    "确定");
+                return;
+            }
+
+            // 阶段三：异步执行恢复（分片复制 + 进度 + 可中断，末尾一次导入）
+            progress = 0f;
+            status = force ? "强制恢复中…" : "恢复中…";
+            restoreCancellation?.Dispose();
+            restoreCancellation = new CancellationTokenSource();
+            try
+            {
+                int restored = await UpscaleJobStore.RestoreAssetsAsync(
+                    directory,
+                    targets,
+                    (value, message) =>
+                    {
+                        progress = value;
+                        status = message;
+                        SafeRepaint();
+                    },
+                    restoreCancellation.Token);
+                progress = 1f;
+                status = $"已恢复 {restored} 个资源：{jobId}" +
+                         (!force && changed > 0 ? $"（跳过 {changed} 个已变化）" : string.Empty);
+            }
+            catch (OperationCanceledException)
+            {
+                status = "恢复已中断，已恢复的资源保持不变";
+            }
+            catch (Exception exception)
+            {
+                status = "恢复失败: " + exception.Message;
+                Debug.LogException(exception);
                 EditorUtility.DisplayDialog("恢复失败", exception.Message, "确定");
             }
+            finally
+            {
+                FinishRestore();
+                RefreshJobs();
+                if (assets.Count > 0)
+                    RefreshAssetUpgradeStates();
+                SafeRepaint();
+            }
+        }
+
+        // 收尾：释放恢复取消源并复位忙碌标记
+        private void FinishRestore()
+        {
+            restoring = false;
+            restoreCancellation?.Dispose();
+            restoreCancellation = null;
+            SafeRepaint();
+        }
+
+        // 粗估恢复耗时：文件复制很快，真实耗时主要在末尾的一次性资源导入，波动较大，只给量级提示
+        private static string EstimateRestoreTimeHint(int count)
+        {
+            if (count <= 0)
+                return "预计耗时：几乎瞬间。";
+            if (count <= 100)
+                return "预计耗时：数秒（复制很快，导入约几秒）。";
+            if (count <= 1000)
+                return "预计耗时：数十秒（导入阶段会短暂占用主线程）。";
+            return "预计耗时：数分钟（末尾一次性导入可能明显占用主线程，请耐心等待）。";
         }
 
         private UpscalerRunSettings BuildSettings()
         {
-            List<string> configuredFolders = sourceFolders
-                .Where(path => !string.IsNullOrWhiteSpace(path))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            List<string> configuredFolders = GetFolderPaths(sourceFolders);
             return new UpscalerRunSettings
             {
                 sourceFolder = configuredFolders.FirstOrDefault() ?? string.Empty,
@@ -746,7 +1325,8 @@ namespace ComfyUIUpscaler.Editor
                 maxAtlasPixels = maxAtlasPixels,
                 requestTimeoutSeconds = Mathf.Max(1, requestTimeoutSeconds),
                 jobTimeoutMinutes = Mathf.Max(1, jobTimeoutMinutes),
-                jpegQuality = jpegQuality
+                jpegQuality = jpegQuality,
+                keepDisplaySize = keepDisplaySize
             };
         }
 
@@ -755,7 +1335,11 @@ namespace ComfyUIUpscaler.Editor
         private void RefreshJobs()
         {
             jobs = UpscaleJobStore.List();
-            historyRows = jobs.Take(10).Select(job => new HistoryRow(this, job)).ToList();
+            // 任务列表变化后作废详情缓存；选中项失效时回退到最新任务
+            detailRows = null;
+            detailRowsJobId = string.Empty;
+            if (jobs.All(job => job.manifest.jobId != selectedJobId))
+                selectedJobId = jobs.FirstOrDefault()?.manifest.jobId ?? string.Empty;
         }
 
         // 异步任务进行中窗口可能被关闭，销毁后调用 Repaint 会报错，这里借助 UnityEngine.Object 的隐式布尔判断守卫
@@ -777,6 +1361,11 @@ namespace ComfyUIUpscaler.Editor
                 foreach (TextureAssetInfo asset in assets)
                     UpgradeAssetStateUtility.Apply(asset, null);
             }
+            // 应用“跳过”标记：命中的资源默认不参与升级
+            UpscaleSkipStore.ApplyToAssets(assets);
+            foreach (TextureAssetInfo asset in assets)
+                if (asset.skipped)
+                    asset.selected = false;
             RebuildAssetRows();
             atlasEstimateDirty = true;
         }
@@ -793,8 +1382,11 @@ namespace ComfyUIUpscaler.Editor
             filteredAssets.Clear();
             foreach (TextureAssetInfo asset in assets)
             {
-                if (UpgradeAssetStateUtility.MatchesFilter(asset, assetUpgradeFilter))
-                    filteredAssets.Add(asset);
+                if (!UpgradeAssetStateUtility.MatchesFilter(asset, assetUpgradeFilter))
+                    continue;
+                if (hideSkipped && asset.skipped)
+                    continue;
+                filteredAssets.Add(asset);
             }
             assetRows = filteredAssets.Select(asset => new AssetRow(this, asset)).ToList();
         }
@@ -822,12 +1414,11 @@ namespace ComfyUIUpscaler.Editor
                 {
                     List<AtlasPageManifest> pages = AtlasPacker.Pack(assets, padding, maxAtlasEdge, maxAtlasPixels);
                     estimatedAtlasPages = pages.Count;
-                    (estimatedMaxPagePixels, estimatedMaxPageEdge) = GetLargestPage(pages);
+                    (_, estimatedMaxPageEdge) = GetLargestPage(pages);
                 }
                 else
                 {
                     estimatedAtlasPages = 0;
-                    estimatedMaxPagePixels = 0;
                     estimatedMaxPageEdge = 0;
                 }
                 atlasEstimateError = string.Empty;
@@ -835,7 +1426,6 @@ namespace ComfyUIUpscaler.Editor
             catch (Exception exception)
             {
                 estimatedAtlasPages = 0;
-                estimatedMaxPagePixels = 0;
                 estimatedMaxPageEdge = 0;
                 atlasEstimateError = exception.Message;
             }
@@ -891,46 +1481,77 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
-        // 组装内存风险提示（仅通知，不阻止执行）
-        private List<string> BuildMemoryWarnings(long peakBytes, int outputEdge)
+        // 运行期间启动显存监视：清零实测峰值并开始后台采样
+        private void StartMemoryMonitor()
+        {
+            observedPeakUsedBytes = 0;
+            memWarnedHigh = false;
+            memMonitorCancellation = new CancellationTokenSource();
+            _ = MonitorMemoryAsync(memMonitorCancellation.Token);
+        }
+
+        private void StopMemoryMonitor()
+        {
+            memMonitorCancellation?.Cancel();
+            memMonitorCancellation?.Dispose();
+            memMonitorCancellation = null;
+        }
+
+        // 后台每 2 秒读一次 ComfyUI 显存，更新可用显存、记录占用峰值，并在接近上限时向日志提醒一次
+        private async Task MonitorMemoryAsync(CancellationToken token)
+        {
+            var client = new ComfyUIClient(comfyUrl, Mathf.Max(1, requestTimeoutSeconds));
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    ComfyDeviceMemory memory = await client.GetDeviceMemoryAsync(token);
+                    ApplyMemoryBudget(memory);
+                    if (memory != null && memory.hasVram && memory.vramTotalBytes > 0)
+                    {
+                        long used = memory.vramTotalBytes - memory.vramFreeBytes;
+                        if (used > observedPeakUsedBytes)
+                            observedPeakUsedBytes = used;
+                        if (!memWarnedHigh && memory.vramFreeBytes < memory.vramTotalBytes * 0.08)
+                        {
+                            memWarnedHigh = true;
+                            liveLog.Add("⚠ 显存已接近上限，若某页失败(OOM) 请调小最大像素数/边长后从历史任务继续");
+                            logScroll.y = float.MaxValue;
+                        }
+                        SafeRepaint();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch
+                {
+                    // 单次采样失败忽略，继续下次
+                }
+
+                try
+                {
+                    await Task.Delay(2000, token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        // 组装风险提示（仅通知，不阻止执行）：输出尺寸为确定性检查；显存改为实测接近上限时提醒
+        private List<string> BuildMemoryWarnings(int outputEdge)
         {
             var warnings = new List<string>();
             if (outputEdge > UpscaleMemoryEstimator.UnityMaxTextureEdge)
                 warnings.Add($"输出图集单边约 {outputEdge} 超过 Unity 上限 {UpscaleMemoryEstimator.UnityMaxTextureEdge}，必然失败，请降低最大边长。");
-            if (memBudgetKnown && peakBytes > 0 && vramFreeBytes > 0 && peakBytes > vramFreeBytes)
-                warnings.Add($"预计单页峰值≈{UpscaleJobStore.FormatBytes(peakBytes)}，超过 ComfyUI 可用显存 " +
-                             $"{UpscaleJobStore.FormatBytes(vramFreeBytes)}，可能 OOM。建议降低最大像素数/边长，或核对峰值倍率。");
+            // 运行中实测可用显存低于总量 8% 时提醒（接近 OOM）
+            if (memBudgetKnown && vramTotalBytes > 0 && vramFreeBytes > 0 &&
+                vramFreeBytes < vramTotalBytes * 0.08)
+                warnings.Add($"显存已接近上限（剩余 {UpscaleJobStore.FormatBytes(vramFreeBytes)}）。若某页失败(OOM)，请调小最大像素数或最大边长后从历史任务继续。");
             return warnings;
-        }
-
-        private void OnFoldersChanged()
-        {
-            // 归一化并仅保留 Assets 下的有效文件夹，非法/重复条目自动剔除
-            var cleaned = new List<string>();
-            bool droppedInvalid = false;
-            foreach (string raw in sourceFolders)
-            {
-                if (string.IsNullOrWhiteSpace(raw))
-                    continue;
-                string path = raw.Trim().Replace((char)92, '/');
-                if (!AssetDatabase.IsValidFolder(path))
-                {
-                    droppedInvalid = true;
-                    continue;
-                }
-                if (!cleaned.Contains(path, StringComparer.OrdinalIgnoreCase))
-                    cleaned.Add(path);
-            }
-            if (droppedInvalid)
-                ShowNotification(new GUIContent("请选择 Assets 下的目录"));
-
-            sourceFolders.Clear();
-            sourceFolders.AddRange(cleaned);
-
-            assets.Clear();
-            RebuildAssetRows();
-            atlasEstimateDirty = true;
-            SavePreferences();
         }
 
         private static string BuildUpgradeSummary(TextureAssetInfo asset)
@@ -986,26 +1607,34 @@ namespace ComfyUIUpscaler.Editor
 
         // ==================== 偏好持久化 ====================
 
+        // 读取历史保存的扫描目录路径（新旧两个偏好键），供 LoadPreferences 转成文件夹对象引用
+        private static List<string> ReadSavedFolderPaths()
+        {
+            var paths = new List<string>();
+            string serialized = EditorPrefs.GetString(PrefPrefix + "SourceFolders", string.Empty);
+            if (!string.IsNullOrEmpty(serialized))
+                paths.AddRange(serialized
+                    .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(path => path.Trim().Replace((char)92, '/'))
+                    .Where(path => !string.IsNullOrEmpty(path)));
+            if (paths.Count == 0)
+            {
+                string legacy = EditorPrefs.GetString(PrefPrefix + "SourceFolder", string.Empty);
+                if (!string.IsNullOrWhiteSpace(legacy))
+                    paths.Add(legacy.Trim().Replace((char)92, '/'));
+            }
+            return paths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
         private void LoadPreferences()
         {
             sourceFolders.Clear();
-            string serializedFolders = EditorPrefs.GetString(PrefPrefix + "SourceFolders", string.Empty);
-            if (!string.IsNullOrEmpty(serializedFolders))
+            foreach (string path in ReadSavedFolderPaths())
             {
-                sourceFolders.AddRange(serializedFolders
-                    .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Select(path => path.Trim().Replace((char)92, '/'))
-                    .Where(path => !string.IsNullOrEmpty(path))
-                    .Distinct(StringComparer.OrdinalIgnoreCase));
+                var folder = AssetDatabase.LoadAssetAtPath<DefaultAsset>(path);
+                if (folder != null)
+                    sourceFolders.Add(folder);
             }
-            if (sourceFolders.Count == 0)
-            {
-                string legacyFolder = EditorPrefs.GetString(PrefPrefix + "SourceFolder", "Assets");
-                if (!string.IsNullOrWhiteSpace(legacyFolder))
-                    sourceFolders.Add(legacyFolder);
-            }
-            if (sourceFolders.Count == 0)
-                sourceFolders.Add("Assets");
 
             comfyUrl = EditorPrefs.GetString(PrefPrefix + "ComfyUrl", "http://127.0.0.1:8188");
             workflowPath = EditorPrefs.GetString(PrefPrefix + "WorkflowPath", string.Empty);
@@ -1015,11 +1644,6 @@ namespace ComfyUIUpscaler.Editor
             expectedScale = EditorPrefs.HasKey(PrefPrefix + "ExpectedScaleFloat")
                 ? EditorPrefs.GetFloat(PrefPrefix + "ExpectedScaleFloat", 4f)
                 : EditorPrefs.GetInt(PrefPrefix + "ExpectedScale", 4);
-            // 峰值倍率默认取预期倍率；仅用于内存预估
-            peakScale = Mathf.Max(1f, EditorPrefs.HasKey(PrefPrefix + "PeakScaleFloat")
-                ? EditorPrefs.GetFloat(PrefPrefix + "PeakScaleFloat", expectedScale)
-                : expectedScale);
-            memorySafetyFactor = Mathf.Clamp(EditorPrefs.GetInt(PrefPrefix + "MemorySafetyFactor", 4), 1, 16);
             padding = EditorPrefs.GetInt(PrefPrefix + "Padding", 32);
             maxAtlasEdge = EditorPrefs.GetInt(PrefPrefix + "MaxAtlasEdge", 4096);
             maxAtlasPixels = long.TryParse(EditorPrefs.GetString(PrefPrefix + "MaxAtlasPixels", "16777216"), out long pixels)
@@ -1028,6 +1652,7 @@ namespace ComfyUIUpscaler.Editor
             requestTimeoutSeconds = EditorPrefs.GetInt(PrefPrefix + "RequestTimeout", 120);
             jobTimeoutMinutes = EditorPrefs.GetInt(PrefPrefix + "JobTimeout", 30);
             jpegQuality = EditorPrefs.GetInt(PrefPrefix + "JpegQuality", 95);
+            keepDisplaySize = EditorPrefs.GetBool(PrefPrefix + "KeepDisplaySize", true);
             assetUpgradeFilter = (UpgradeAssetFilter)Mathf.Clamp(
                 EditorPrefs.GetInt(PrefPrefix + "UpgradeAssetFilter", 0),
                 0,
@@ -1036,11 +1661,7 @@ namespace ComfyUIUpscaler.Editor
 
         private void SavePreferences()
         {
-            List<string> configuredFolders = sourceFolders
-                .Where(path => !string.IsNullOrWhiteSpace(path))
-                .Select(path => path.Trim().Replace((char)92, '/'))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            List<string> configuredFolders = GetFolderPaths(sourceFolders);
             EditorPrefs.SetString(PrefPrefix + "SourceFolders", string.Join("\n", configuredFolders));
             EditorPrefs.SetString(PrefPrefix + "SourceFolder", configuredFolders.FirstOrDefault() ?? string.Empty);
             EditorPrefs.SetString(PrefPrefix + "ComfyUrl", comfyUrl ?? string.Empty);
@@ -1049,14 +1670,13 @@ namespace ComfyUIUpscaler.Editor
             EditorPrefs.SetString(PrefPrefix + "InputFieldName", inputFieldName ?? string.Empty);
             EditorPrefs.SetString(PrefPrefix + "OutputNodeId", outputNodeId ?? string.Empty);
             EditorPrefs.SetFloat(PrefPrefix + "ExpectedScaleFloat", expectedScale);
-            EditorPrefs.SetFloat(PrefPrefix + "PeakScaleFloat", peakScale);
-            EditorPrefs.SetInt(PrefPrefix + "MemorySafetyFactor", memorySafetyFactor);
             EditorPrefs.SetInt(PrefPrefix + "Padding", padding);
             EditorPrefs.SetInt(PrefPrefix + "MaxAtlasEdge", maxAtlasEdge);
             EditorPrefs.SetString(PrefPrefix + "MaxAtlasPixels", maxAtlasPixels.ToString());
             EditorPrefs.SetInt(PrefPrefix + "RequestTimeout", requestTimeoutSeconds);
             EditorPrefs.SetInt(PrefPrefix + "JobTimeout", jobTimeoutMinutes);
             EditorPrefs.SetInt(PrefPrefix + "JpegQuality", jpegQuality);
+            EditorPrefs.SetBool(PrefPrefix + "KeepDisplaySize", keepDisplaySize);
             EditorPrefs.SetInt(PrefPrefix + "UpgradeAssetFilter", (int)assetUpgradeFilter);
         }
 
@@ -1087,6 +1707,26 @@ namespace ComfyUIUpscaler.Editor
                         return;
                     asset.selected = value;
                     owner.MarkEstimateDirty();
+                }
+            }
+
+            // 逐行“跳过”标记：写入 UpscaleSkipStore（按 GUID），勾选时同时取消该资源的选择
+            [TableColumnWidth(56)]
+            [HideLabel]
+            [ShowInInspector]
+            [PropertyTooltip("勾选表示该资源不升级；批量选择会自动跳过它")]
+            public bool Skip
+            {
+                get => asset.skipped;
+                set
+                {
+                    if (asset.skipped == value)
+                        return;
+                    asset.skipped = value;
+                    UpscaleSkipStore.SetAssetSkipped(asset.guid, value);
+                    if (value)
+                        asset.selected = false;
+                    owner.OnSkipToggled();
                 }
             }
 
@@ -1146,64 +1786,83 @@ namespace ComfyUIUpscaler.Editor
             private string UpgradeTooltip => BuildUpgradeTooltip(asset);
         }
 
-        // 历史表行：按任务状态条件启用“继续/恢复”，并提供打开目录
-        private sealed class HistoryRow
+        // 历史详情里“被修改资源”单行的展示数据（构建时算好，绘制只读）
+        private sealed class DetailRow
         {
             private readonly ComfyUIUpscalerWindow owner;
             private readonly JobRecord job;
 
-            public HistoryRow(ComfyUIUpscalerWindow owner, JobRecord job)
+            // 原始数据字段：仅用于构建与展示计算，[HideInTables] 使其不作为表格列绘制（避免变成输入框/重复列）
+            [HideInTables] public string assetPath;
+            [HideInTables] public string guid;
+            [HideInTables] public int beforeWidth;
+            [HideInTables] public int beforeHeight;
+            [HideInTables] public int afterWidth;
+            [HideInTables] public int afterHeight;
+            [HideInTables] public float scale;
+            [HideInTables] public long beforeBytes;
+            [HideInTables] public long afterBytes;
+
+            public DetailRow(ComfyUIUpscalerWindow owner, JobRecord job)
             {
                 this.owner = owner;
                 this.job = job;
             }
 
-            [TableColumnWidth(190)]
+            // 展示资源名（悬浮显示完整路径）；完整路径仍参与 [Searchable] 搜索
+            [TableColumnWidth(280)]
+            [DisplayAsString]
+            [HideLabel]
+            [PropertyTooltip("$assetPath")]
+            [ShowInInspector]
+            public string Name => string.IsNullOrEmpty(assetPath) ? "-" : System.IO.Path.GetFileName(assetPath);
+
+            [TableColumnWidth(150)]
             [DisplayAsString]
             [HideLabel]
             [ShowInInspector]
-            public string JobId => job.manifest.jobId;
+            public string Size
+            {
+                get
+                {
+                    string after = afterWidth > 0 && afterHeight > 0 ? $"{afterWidth}x{afterHeight}" : "-";
+                    return $"{beforeWidth}x{beforeHeight} → {after}";
+                }
+            }
 
-            [TableColumnWidth(100)]
+            [TableColumnWidth(160)]
             [DisplayAsString]
             [HideLabel]
             [ShowInInspector]
-            public string Status => job.manifest.status;
+            public string Bytes
+            {
+                get
+                {
+                    string before = beforeBytes > 0 ? UpscaleJobStore.FormatBytes(beforeBytes) : "-";
+                    string after = afterBytes > 0 ? UpscaleJobStore.FormatBytes(afterBytes) : "-";
+                    return $"{before} → {after}";
+                }
+            }
 
-            [TableColumnWidth(120)]
+            [TableColumnWidth(56)]
             [DisplayAsString]
             [HideLabel]
             [ShowInInspector]
-            public string Scale => $"{job.manifest.assets.Count} 文件 / {job.manifest.pages.Count} 页";
+            public string Scale => scale > 0f ? $"{scale:0.##}x" : "-";
 
-            [TableColumnWidth(260)]
-            [DisplayAsString]
-            [HideLabel]
-            [PropertyTooltip("处理前 -> 处理后（变化量、变化率）")]
-            [ShowInInspector]
-            public string SizeSummary => UpscaleJobStore.FormatSizeSummary(job.manifest);
+            [TableColumnWidth(60, false)]
+            [Button("定位")]
+            [PropertyTooltip("在工程窗口中定位并高亮该资源")]
+            private void Locate() => owner?.PingAsset(guid, assetPath);
 
-            [TableColumnWidth(72, false)]
-            [Button("继续")]
-            [PropertyTooltip("从中断处继续，已完成的图集页不会重跑")]
-            [EnableIf(nameof(CanContinue))]
-            private void Continue() => owner.Resume(job);
-
-            [TableColumnWidth(72, false)]
-            [Button("恢复")]
-            [PropertyTooltip("仅已完成且当前文件未变化的任务可恢复")]
+            // 仅当该资源存在备份且未在忙碌时允许单独回滚
+            [TableColumnWidth(60, false)]
             [EnableIf(nameof(CanRestore))]
-            private void RestoreJob() => owner.Restore(job);
+            [Button("恢复")]
+            [PropertyTooltip("用本任务的备份单独回滚该资源（含 .meta）")]
+            private void RestoreOne() => owner?.RestoreSingleAsset(job, this);
 
-            [TableColumnWidth(80, false)]
-            [Button("打开目录")]
-            private void OpenDirectory() => EditorUtility.RevealInFinder(job.directory);
-
-            private bool CanContinue => owner != null && !owner.Busy &&
-                                        UpscaleJobStore.CanAttemptResume(job.manifest);
-
-            private bool CanRestore => owner != null && !owner.Busy &&
-                                       job.manifest.status == JobStatus.Completed;
+            private bool CanRestore => owner != null && !owner.Busy && beforeBytes > 0;
         }
     }
 }

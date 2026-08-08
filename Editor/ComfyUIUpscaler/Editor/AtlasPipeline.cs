@@ -283,7 +283,11 @@ namespace ComfyUIUpscaler.Editor
                             pixels[i].a = 255;
                     }
 
-                    string relative = Path.Combine("staged", info.assetPath).Replace('\\', '/');
+                    // 暂存文件名改用资源 GUID 短名，避免镜像深层 Assets 路径导致 Windows 260 长路径写入失败
+                    string stagedExtension = string.IsNullOrEmpty(info.extension)
+                        ? Path.GetExtension(info.assetPath)
+                        : info.extension;
+                    string relative = "staged/" + info.guid + stagedExtension;
                     string stagedPath = Path.Combine(jobDirectory, relative);
                     Directory.CreateDirectory(Path.GetDirectoryName(stagedPath));
                     EncodeImage(stagedPath, info.extension, pixels, width, height, jpegQuality);
