@@ -51,5 +51,11 @@ namespace UIR.EditorTools
         {
             ComfyUIUpscalerWindow.Open();
         }
+
+        [MenuItem("UIR/同步 Art UI 图集", false, 303)]
+        private static void Menu_ArtUISpriteAtlasSync()
+        {
+            ArtUISpriteAtlasSyncWindow.Open();
+        }
     }
 }
