@@ -1,0 +1,42 @@
+{
+  "3": {
+    "inputs": {
+      "image": "ComfyUIUpscalerInput.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "19": {
+    "inputs": {
+      "upscale_model": "4x-UltraSharp.pth",
+      "mode": "rescale",
+      "rescale_factor": 5.0,
+      "resize_width": 1024,
+      "resampling_method": "lanczos",
+      "supersample": "true",
+      "rounding_modulus": 8,
+      "image": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "CR Upscale Image",
+    "_meta": {
+      "title": "CR Upscale Image"
+    }
+  },
+  "10": {
+    "inputs": {
+      "images": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "预览图像"
+    }
+  }
+}

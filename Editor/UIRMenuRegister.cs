@@ -1,5 +1,6 @@
 using UnityEditor;
 using UIR.EditorTools.Svn;
+using ComfyUIUpscaler.Editor;
 
 namespace UIR.EditorTools
 {
@@ -45,16 +46,10 @@ namespace UIR.EditorTools
             GameViewScreenshotWindow.Open();
         }
 
-        [MenuItem("UIR/SpriteAtlas 拆分", false, 302)]
-        private static void Menu_SpriteAtlasSplitter()
+        [MenuItem("UIR/ComfyUI 图片批量高清化", false, 302)]
+        private static void Menu_ComfyUIUpscaler()
         {
-            SpriteAtlasSplitterWindow.Open();
-        }
-
-        [MenuItem("UIR/图片降尺寸", false, 303)]
-        private static void Menu_TextureDownscale()
-        {
-            TextureDownscaleWindow.Open();
+            ComfyUIUpscalerWindow.Open();
         }
     }
 }
