@@ -279,7 +279,7 @@ namespace ComfyUIUpscaler.Editor
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     expectedScale = Mathf.Max(1f, EditorGUILayout.FloatField(
-                        new GUIContent("放大倍率", "工作流最终输出相对原图的放大倍率（例如 1.44）。仅用于估算输出尺寸与预警，不改变工作流实际行为。"),
+                        new GUIContent("目标倍率", "最终期望的放大倍率（例如 1.44）。ComfyUI 需输出 ≥ 该值的整数 POT 倍率（如 2×/4×，工作流内不要再缩放）；工具会自动按整数倍精确裁剪，再降采样到该目标倍率，保证同尺寸输入得到一致的输出尺寸。"),
                         expectedScale));
                     padding = Mathf.Max(0, EditorGUILayout.IntField("Padding", padding));
                 }
@@ -671,6 +671,152 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
+        // 详情资源表上方工具栏：状态筛选 + 刷新状态(异步) + 恢复筛选结果(异步)
+        [PropertyOrder(605)]
+        [ShowIf(nameof(ShowHistoryDetailTable))]
+        [OnInspectorGUI]
+        private void DrawDetailToolbar()
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField("状态筛选", GUILayout.Width(56f));
+                string[] options = { "全部", "可恢复", "已变化", "无备份" };
+                int index = (int)detailStateFilter;
+                int picked = EditorGUILayout.Popup(index, options, GUILayout.Width(90f));
+                if (picked != index)
+                {
+                    detailStateFilter = (DetailStateFilter)picked;
+                    ApplyDetailFilter();
+                }
+
+                using (new EditorGUI.DisabledScope(Busy || detailStatusRefreshing))
+                {
+                    if (GUILayout.Button(new GUIContent("刷新状态", "异步校验各资源当前是否仍与本任务输出一致"), GUILayout.Width(80f)))
+                        RefreshDetailStatuses();
+
+                    using (new EditorGUI.DisabledScope(!detailStatusReady || (detailRows?.Count ?? 0) == 0))
+                    {
+                        if (GUILayout.Button(
+                                new GUIContent($"恢复筛选结果（{detailRows?.Count ?? 0}）", "按当前筛选批量恢复：用本任务备份覆盖当前文件（含 .meta），跳过无备份项"),
+                                GUILayout.Width(150f)))
+                            RestoreFilteredDetail();
+                    }
+                }
+                GUILayout.FlexibleSpace();
+            }
+
+            if (detailStatusRefreshing)
+            {
+                Rect rect = GUILayoutUtility.GetRect(100f, 16f, GUILayout.ExpandWidth(true));
+                EditorGUI.ProgressBar(rect, progress, status);
+            }
+            else if (!detailStatusReady)
+            {
+                EditorGUILayout.LabelField("状态未刷新：点击“刷新状态”后可见每个资源当前是否可安全恢复", EditorStyles.miniLabel);
+            }
+            else if (allDetailRows != null)
+            {
+                int safe = allDetailRows.Count(row => row.status == DetailStatus.Safe);
+                int changed = allDetailRows.Count(row => row.status == DetailStatus.Changed);
+                int missing = allDetailRows.Count(row => row.status == DetailStatus.Missing);
+                EditorGUILayout.LabelField($"可恢复 {safe} · 已变化 {changed} · 无备份 {missing}", EditorStyles.miniLabel);
+            }
+        }
+
+        // 异步刷新详情表各行状态：复用 BuildRestorePlanAsync 的哈希分类，避免同步哈希大量文件卡死
+        private async void RefreshDetailStatuses()
+        {
+            JobRecord job = jobs.FirstOrDefault(record => record.manifest.jobId == selectedJobId);
+            if (job == null || allDetailRows == null)
+                return;
+            detailStatusRefreshing = true;
+            progress = 0f;
+            status = "校验资源状态…";
+            var cancellation = new CancellationTokenSource();
+            try
+            {
+                RestorePlan plan = await UpscaleJobStore.BuildRestorePlanAsync(
+                    job.directory,
+                    (value, message) => { progress = value; status = message; SafeRepaint(); },
+                    cancellation.Token);
+                var safe = new HashSet<string>(plan.safeAssets.Select(asset => asset.guid), StringComparer.Ordinal);
+                var changed = new HashSet<string>(plan.changedAssets.Select(asset => asset.guid), StringComparer.Ordinal);
+                foreach (DetailRow row in allDetailRows)
+                {
+                    if (!string.IsNullOrEmpty(row.guid) && safe.Contains(row.guid))
+                        row.status = DetailStatus.Safe;
+                    else if (!string.IsNullOrEmpty(row.guid) && changed.Contains(row.guid))
+                        row.status = DetailStatus.Changed;
+                    else
+                        row.status = DetailStatus.Missing;
+                    // 填充逐行变化详情（移动/图片/元数据等）
+                    row.changeDetail = !string.IsNullOrEmpty(row.guid) &&
+                                       plan.detailByGuid.TryGetValue(row.guid, out string detail)
+                        ? detail
+                        : string.Empty;
+                }
+                detailStatusReady = true;
+                status = "状态已刷新";
+                ApplyDetailFilter();
+            }
+            catch (Exception exception)
+            {
+                status = "状态刷新失败: " + exception.Message;
+                Debug.LogException(exception);
+            }
+            finally
+            {
+                detailStatusRefreshing = false;
+                cancellation.Dispose();
+                SafeRepaint();
+            }
+        }
+
+        // 按当前筛选批量恢复：只恢复有备份(可恢复/已变化)的行，复用异步恢复流程
+        private async void RestoreFilteredDetail()
+        {
+            JobRecord job = jobs.FirstOrDefault(record => record.manifest.jobId == selectedJobId);
+            if (job == null || detailRows == null || Busy || detailStatusRefreshing)
+                return;
+
+            var targets = new List<TextureAssetInfo>();
+            int changedCount = 0;
+            foreach (DetailRow row in detailRows)
+            {
+                if (row.status == DetailStatus.Missing)
+                    continue;
+                if (row.status == DetailStatus.Changed)
+                    changedCount++;
+                targets.Add(new TextureAssetInfo { assetPath = row.assetPath, guid = row.guid });
+            }
+            if (targets.Count == 0)
+            {
+                EditorUtility.DisplayDialog("无可恢复项", "当前筛选结果中没有可恢复的资源（可能均为“无备份”）。", "确定");
+                return;
+            }
+
+            int safeCount = targets.Count - changedCount;
+            string body = changedCount > 0
+                // 含已变化项：明确告知会覆盖当前改动
+                ? $"其中 {safeCount} 个“可恢复”（与本任务输出一致）、{changedCount} 个“已变化”，恢复会覆盖这 {changedCount} 个的当前改动。\n"
+                // 全部可恢复：明确不会覆盖任何改动，让用户放心
+                : "全部为“可恢复”项（当前文件仍与本任务输出一致），恢复不会覆盖任何改动。\n";
+            string message =
+                $"将按当前筛选恢复 {targets.Count} 个资源（任务 {job.manifest.jobId}）：\n" +
+                body +
+                $"{EstimateRestoreTimeHint(targets.Count)}\n\n是否继续？";
+            if (!EditorUtility.DisplayDialog("恢复筛选结果", message, "恢复", "取消"))
+                return;
+
+            restoring = true;
+            await ExecuteRestoreAsync(
+                job.directory,
+                targets,
+                job.manifest.jobId,
+                "恢复中…",
+                changedCount > 0 ? $"（含 {changedCount} 个已变化）" : string.Empty);
+        }
+
         private static void DrawKeyValue(string key, string value)
         {
             using (new EditorGUILayout.HorizontalScope())
@@ -712,10 +858,37 @@ namespace ComfyUIUpscaler.Editor
         {
             if (job == null)
                 return;
-            if (detailRowsJobId == job.manifest.jobId && detailRows != null)
+            if (detailRowsJobId == job.manifest.jobId && allDetailRows != null)
                 return;
             detailRowsJobId = job.manifest.jobId;
-            detailRows = BuildDetailRows(job);
+            allDetailRows = BuildDetailRows(job);
+            // 切换任务后状态需重新计算，筛选回到“全部”
+            detailStateFilter = DetailStateFilter.All;
+            detailStatusReady = false;
+            ApplyDetailFilter();
+        }
+
+        // 按当前状态筛选，重建绑定到表格的 detailRows 视图
+        private void ApplyDetailFilter()
+        {
+            if (allDetailRows == null)
+            {
+                detailRows = null;
+                return;
+            }
+            if (detailStateFilter == DetailStateFilter.All)
+            {
+                detailRows = new List<DetailRow>(allDetailRows);
+                return;
+            }
+            DetailStatus want;
+            switch (detailStateFilter)
+            {
+                case DetailStateFilter.Safe: want = DetailStatus.Safe; break;
+                case DetailStateFilter.Changed: want = DetailStatus.Changed; break;
+                default: want = DetailStatus.Missing; break;
+            }
+            detailRows = allDetailRows.Where(row => row.status == want).ToList();
         }
 
         private List<DetailRow> BuildDetailRows(JobRecord job)
@@ -780,6 +953,23 @@ namespace ComfyUIUpscaler.Editor
         // 历史页签：状态筛选、选中任务与资源明细缓存
         private enum HistoryFilter { All, Completed, Failed, Canceled, RolledBack, Processing }
         private HistoryFilter historyFilter = HistoryFilter.All;
+
+        // 详情资源表：相对本任务的可恢复状态（需异步计算）与其筛选
+        private enum DetailStatus { Unknown, Safe, Changed, Missing }
+        private enum DetailStateFilter { All, Safe, Changed, Missing }
+        private DetailStateFilter detailStateFilter = DetailStateFilter.All;
+        private bool detailStatusReady;
+
+        private static string DetailStatusLabel(DetailStatus state)
+        {
+            switch (state)
+            {
+                case DetailStatus.Safe: return "可恢复";
+                case DetailStatus.Changed: return "已变化";
+                case DetailStatus.Missing: return "无备份";
+                default: return "未刷新";
+            }
+        }
         private string selectedJobId = string.Empty;
         private Vector2 historyListScroll;
         private Vector2 historyDetailScroll;
@@ -792,10 +982,15 @@ namespace ComfyUIUpscaler.Editor
         [HideLabel]
         [ShowInInspector]
         private List<DetailRow> detailRows;
+        // 全量明细（未筛选），detailRows 为其按状态筛选后的视图
+        private List<DetailRow> allDetailRows;
         private string detailRowsJobId = string.Empty;
 
-        private bool ShowHistoryDetailTable => ShowHistoryTab && detailRows != null && detailRows.Count > 0;
-        private string DetailTableTitle => $"被修改的资源（{detailRows?.Count ?? 0}）";
+        private bool ShowHistoryDetailTable => ShowHistoryTab && allDetailRows != null && allDetailRows.Count > 0;
+        private string DetailTableTitle =>
+            allDetailRows != null && (detailRows?.Count ?? 0) != allDetailRows.Count
+                ? $"被修改的资源（{detailRows?.Count ?? 0}/{allDetailRows.Count}）"
+                : $"被修改的资源（{allDetailRows?.Count ?? 0}）";
         private GUIStyle historyEntryStyle;
         private GUIStyle HistoryEntryStyle => historyEntryStyle ??= new GUIStyle(GUI.skin.button)
         {
@@ -828,6 +1023,9 @@ namespace ComfyUIUpscaler.Editor
         private CancellationTokenSource scanCancellation;
         private bool restoring;
         private CancellationTokenSource restoreCancellation;
+
+        // 详情表状态刷新中（异步哈希校验），期间禁用工具栏按钮
+        private bool detailStatusRefreshing;
 
         // 运行、扫描或恢复期间都视为忙碌，统一禁用配置编辑与开始操作
         private bool Busy => running || scanning || restoring;
@@ -1246,8 +1444,20 @@ namespace ComfyUIUpscaler.Editor
             }
 
             // 阶段三：异步执行恢复（分片复制 + 进度 + 可中断，末尾一次导入）
+            string doneSuffix = !force && changed > 0 ? $"（跳过 {changed} 个已变化）" : string.Empty;
+            await ExecuteRestoreAsync(directory, targets, jobId, force ? "强制恢复中…" : "恢复中…", doneSuffix);
+        }
+
+        // 异步执行恢复的公用实现：分片复制 + 进度 + 可中断，末尾一次导入；调用前应已设置 restoring=true
+        private async Task ExecuteRestoreAsync(
+            string directory,
+            IList<TextureAssetInfo> targets,
+            string jobId,
+            string busyStatus,
+            string doneSuffix)
+        {
             progress = 0f;
-            status = force ? "强制恢复中…" : "恢复中…";
+            status = busyStatus;
             restoreCancellation?.Dispose();
             restoreCancellation = new CancellationTokenSource();
             try
@@ -1263,8 +1473,7 @@ namespace ComfyUIUpscaler.Editor
                     },
                     restoreCancellation.Token);
                 progress = 1f;
-                status = $"已恢复 {restored} 个资源：{jobId}" +
-                         (!force && changed > 0 ? $"（跳过 {changed} 个已变化）" : string.Empty);
+                status = $"已恢复 {restored} 个资源：{jobId}{doneSuffix}";
             }
             catch (OperationCanceledException)
             {
@@ -1337,6 +1546,9 @@ namespace ComfyUIUpscaler.Editor
             jobs = UpscaleJobStore.List();
             // 任务列表变化后作废详情缓存；选中项失效时回退到最新任务
             detailRows = null;
+            allDetailRows = null;
+            detailStatusReady = false;
+            detailStateFilter = DetailStateFilter.All;
             detailRowsJobId = string.Empty;
             if (jobs.All(job => job.manifest.jobId != selectedJobId))
                 selectedJobId = jobs.FirstOrDefault()?.manifest.jobId ?? string.Empty;
@@ -1849,6 +2061,26 @@ namespace ComfyUIUpscaler.Editor
             [HideLabel]
             [ShowInInspector]
             public string Scale => scale > 0f ? $"{scale:0.##}x" : "-";
+
+            // 相对本任务的当前状态；点“刷新状态”后由 BuildRestorePlanAsync 计算填充
+            [HideInTables] public DetailStatus status = DetailStatus.Unknown;
+
+            [TableColumnWidth(84)]
+            [DisplayAsString]
+            [HideLabel]
+            [PropertyTooltip("相对本任务的当前状态：可恢复=当前文件仍与本任务输出一致；已变化=已改动或已回滚；无备份=无法恢复。需点“刷新状态”计算。")]
+            [ShowInInspector]
+            public string StatusText => DetailStatusLabel(status);
+
+            // 变化详情：区分“已移动/图片内容/元数据(.meta)”等具体原因，刷新状态后填充
+            [HideInTables] public string changeDetail = string.Empty;
+
+            [TableColumnWidth(190)]
+            [DisplayAsString]
+            [HideLabel]
+            [PropertyTooltip("$changeDetail")]
+            [ShowInInspector]
+            public string Detail => string.IsNullOrEmpty(changeDetail) ? "-" : changeDetail;
 
             [TableColumnWidth(60, false)]
             [Button("定位")]

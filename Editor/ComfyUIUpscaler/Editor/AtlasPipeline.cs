@@ -214,66 +214,57 @@ namespace ComfyUIUpscaler.Editor
                 if (!ImageConversion.LoadImage(output, bytes, false))
                     throw new InvalidDataException("ComfyUI 输出不是可解码图片: " + page.outputFile);
 
-                int expectedWidth = Mathf.FloorToInt(page.width * expectedScale);
-                int expectedHeight = Mathf.FloorToInt(page.height * expectedScale);
-                const int pageDimensionTolerance = 1;
-                if (!MatchesExpectedDimensions(
-                    page.width,
-                    page.height,
-                    output.width,
-                    output.height,
-                    expectedScale,
-                    pageDimensionTolerance))
+                // 探测 ComfyUI 实际放大倍率：由用户在 ComfyUI 侧手动保证为整数 POT（如 2×/4×）且 ≥ 目标倍率。
+                // 整数倍率下，裁剪坐标 = 原坐标 × 整数，精确且与图在图集中的位置无关 → 同尺寸输入必得同尺寸裁剪。
+                float rawScaleX = (float)output.width / page.width;
+                float rawScaleY = (float)output.height / page.height;
+                int modelScale = Mathf.RoundToInt(rawScaleX);
+                const float scaleIntegerTolerance = 0.02f;
+                if (modelScale < 1 ||
+                    Mathf.Abs(rawScaleX - modelScale) > scaleIntegerTolerance ||
+                    Mathf.Abs(rawScaleY - modelScale) > scaleIntegerTolerance)
                 {
                     throw new InvalidDataException(
                         $"图集页 {page.pageIndex} 输出为 {output.width}x{output.height}，" +
-                        $"预期约 {expectedWidth}x{expectedHeight} ({expectedScale:0.##}x)。");
+                        $"相对输入 {page.width}x{page.height} 不是整数倍（探测到约 {rawScaleX:0.###}x）。" +
+                        "请在 ComfyUI 侧使用纯整数倍放大（不要在工作流内再做缩放）。");
+                }
+                if (modelScale < expectedScale)
+                {
+                    throw new InvalidDataException(
+                        $"图集页 {page.pageIndex} 的放大倍率 {modelScale}x 小于目标倍率 {expectedScale:0.##}x，" +
+                        "无法通过降采样得到目标尺寸。请在 ComfyUI 侧提高放大倍率。");
                 }
 
-                float scaleX = (float)output.width / page.width;
-                float scaleY = (float)output.height / page.height;
-
-                page.outputScale = scaleX;
+                page.outputScale = modelScale;
                 Color32[] outputPixels = output.GetPixels32();
                 foreach (AtlasPlacement placement in page.placements)
                 {
                     TextureAssetInfo info = assetsByPath[placement.assetPath];
-                    int x0 = Mathf.RoundToInt(placement.contentRect.xMin * scaleX);
-                    int y0 = Mathf.RoundToInt(placement.contentRect.yMin * scaleY);
-                    int x1 = Mathf.RoundToInt(placement.contentRect.xMax * scaleX);
-                    int y1 = Mathf.RoundToInt(placement.contentRect.yMax * scaleY);
-                    int width = x1 - x0;
-                    int height = y1 - y0;
-                    if (width <= 0 || height <= 0 || x0 < 0 || y0 < 0 || x1 > output.width || y1 > output.height)
-                        throw new InvalidDataException("拆图区域越界: " + placement.assetPath);
-                    int expectedAssetWidth = Mathf.FloorToInt(info.width * expectedScale);
-                    int expectedAssetHeight = Mathf.FloorToInt(info.height * expectedScale);
-                    const int assetDimensionTolerance = 2;
-                    if (!MatchesExpectedDimensions(
-                        info.width,
-                        info.height,
-                        width,
-                        height,
-                        expectedScale,
-                        assetDimensionTolerance))
-                    {
-                        throw new InvalidDataException(
-                            $"单图输出尺寸与预期倍率不一致: {placement.assetPath}，" +
-                            $"输出 {width}x{height}，预期约 {expectedAssetWidth}x{expectedAssetHeight}。");
-                    }
 
-                    var pixels = new Color32[checked(width * height)];
-                    for (int y = 0; y < height; y++)
-                    {
-                        int sourceOffset = (y0 + y) * output.width + x0;
-                        int destinationOffset = y * width;
-                        Array.Copy(outputPixels, sourceOffset, pixels, destinationOffset, width);
-                    }
+                    // 第一步：按整数倍率精确裁出该图（例如 40×40 → 恒为 40·N × 40·N）
+                    int cropX = Mathf.RoundToInt(placement.contentRect.xMin) * modelScale;
+                    int cropY = Mathf.RoundToInt(placement.contentRect.yMin) * modelScale;
+                    int cropW = Mathf.RoundToInt(placement.contentRect.width) * modelScale;
+                    int cropH = Mathf.RoundToInt(placement.contentRect.height) * modelScale;
+                    if (cropW <= 0 || cropH <= 0 || cropX < 0 || cropY < 0 ||
+                        cropX + cropW > output.width || cropY + cropH > output.height)
+                        throw new InvalidDataException("拆图区域越界: " + placement.assetPath);
+
+                    var cropped = new Color32[checked(cropW * cropH)];
+                    for (int y = 0; y < cropH; y++)
+                        Array.Copy(outputPixels, (cropY + y) * output.width + cropX, cropped, y * cropW, cropW);
+
+                    // 第二步：目标尺寸只由“原始尺寸 × 目标倍率”决定（与位置、与所在页无关）→ 全局一致
+                    int targetW = Mathf.Max(1, Mathf.RoundToInt(info.width * expectedScale));
+                    int targetH = Mathf.Max(1, Mathf.RoundToInt(info.height * expectedScale));
+                    // 从更高分辨率的整数倍裁剪块降采样到目标（超采样 + 面积平均，抗锯齿、无放大发虚）
+                    Color32[] pixels = DownsampleRgbArea(cropped, cropW, cropH, targetW, targetH);
 
                     if (info.hasAlpha && info.extension == ".png")
                     {
                         SourceImage original = LoadSource(info);
-                        byte[] alpha = ResizeAlphaBilinear(original.pixels, original.width, original.height, width, height);
+                        byte[] alpha = ResizeAlphaBilinear(original.pixels, original.width, original.height, targetW, targetH);
                         for (int i = 0; i < pixels.Length; i++)
                             pixels[i].a = alpha[i];
                     }
@@ -290,10 +281,10 @@ namespace ComfyUIUpscaler.Editor
                     string relative = "staged/" + info.guid + stagedExtension;
                     string stagedPath = Path.Combine(jobDirectory, relative);
                     Directory.CreateDirectory(Path.GetDirectoryName(stagedPath));
-                    EncodeImage(stagedPath, info.extension, pixels, width, height, jpegQuality);
-                    placement.outputWidth = width;
-                    placement.outputHeight = height;
-                    placement.scale = (float)width / info.width;
+                    EncodeImage(stagedPath, info.extension, pixels, targetW, targetH, jpegQuality);
+                    placement.outputWidth = targetW;
+                    placement.outputHeight = targetH;
+                    placement.scale = (float)targetW / info.width;
                     placement.stagedFile = relative;
                 }
             }
@@ -435,6 +426,54 @@ namespace ComfyUIUpscaler.Editor
                     float bottom = Mathf.Lerp(source[y0 * sourceWidth + x0].a, source[y0 * sourceWidth + x1].a, tx);
                     float top = Mathf.Lerp(source[y1 * sourceWidth + x0].a, source[y1 * sourceWidth + x1].a, tx);
                     result[y * destinationWidth + x] = (byte)Mathf.RoundToInt(Mathf.Lerp(bottom, top, ty));
+                }
+            }
+            return result;
+        }
+
+        // RGB 面积（box）降采样：对每个目标像素，取其在源图覆盖范围内的所有源像素求平均。
+        // 相比双线性只取 2×2，面积平均在 2×/4× 这类较大降采样比下能保留更多细节、抗锯齿更好；alpha 单独处理。
+        private static Color32[] DownsampleRgbArea(
+            Color32[] source,
+            int sourceWidth,
+            int sourceHeight,
+            int destinationWidth,
+            int destinationHeight)
+        {
+            var result = new Color32[checked(destinationWidth * destinationHeight)];
+            for (int y = 0; y < destinationHeight; y++)
+            {
+                int sy0 = Mathf.FloorToInt((float)y * sourceHeight / destinationHeight);
+                int sy1 = Mathf.Min(sourceHeight - 1, Mathf.CeilToInt((float)(y + 1) * sourceHeight / destinationHeight) - 1);
+                if (sy1 < sy0)
+                    sy1 = sy0;
+                for (int x = 0; x < destinationWidth; x++)
+                {
+                    int sx0 = Mathf.FloorToInt((float)x * sourceWidth / destinationWidth);
+                    int sx1 = Mathf.Min(sourceWidth - 1, Mathf.CeilToInt((float)(x + 1) * sourceWidth / destinationWidth) - 1);
+                    if (sx1 < sx0)
+                        sx1 = sx0;
+
+                    int sumR = 0, sumG = 0, sumB = 0, count = 0;
+                    for (int yy = sy0; yy <= sy1; yy++)
+                    {
+                        int rowOffset = yy * sourceWidth;
+                        for (int xx = sx0; xx <= sx1; xx++)
+                        {
+                            Color32 c = source[rowOffset + xx];
+                            sumR += c.r;
+                            sumG += c.g;
+                            sumB += c.b;
+                            count++;
+                        }
+                    }
+                    if (count == 0)
+                        count = 1;
+                    result[y * destinationWidth + x] = new Color32(
+                        (byte)(sumR / count),
+                        (byte)(sumG / count),
+                        (byte)(sumB / count),
+                        255);
                 }
             }
             return result;

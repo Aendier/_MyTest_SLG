@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -183,6 +184,41 @@ namespace ComfyUIUpscaler.Editor
             using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             using (SHA256 sha256 = SHA256.Create())
                 return ToHex(sha256.ComputeHash(stream));
+        }
+
+        // 哈希缓存：以(大小,最后修改时间)作为文件指纹；命中则跳过重复哈希，可被多线程并发访问
+        private struct HashCacheEntry
+        {
+            public long size;
+            public long ticks;
+            public string sha;
+        }
+
+        private static readonly ConcurrentDictionary<string, HashCacheEntry> HashCache =
+            new ConcurrentDictionary<string, HashCacheEntry>(StringComparer.Ordinal);
+
+        // 带缓存的文件哈希：文件大小与最后修改时间未变则直接复用上次结果，避免重复全量哈希（线程安全）
+        public static string ComputeFileSha256Cached(string path)
+        {
+            long size = 0;
+            long ticks = 0;
+            try
+            {
+                var info = new FileInfo(path);
+                size = info.Length;
+                ticks = info.LastWriteTimeUtc.Ticks;
+            }
+            catch
+            {
+                // 取指纹失败时退化为不缓存的直接哈希
+            }
+
+            if (HashCache.TryGetValue(path, out HashCacheEntry cached) && cached.size == size && cached.ticks == ticks)
+                return cached.sha;
+
+            string sha = ComputeFileSha256(path);
+            HashCache[path] = new HashCacheEntry { size = size, ticks = ticks, sha = sha };
+            return sha;
         }
 
         private static string ToHex(byte[] bytes)

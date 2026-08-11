@@ -25,6 +25,8 @@ namespace ComfyUIUpscaler.Editor
         public readonly List<TextureAssetInfo> changedAssets = new List<TextureAssetInfo>();
         public readonly List<string> changedNotes = new List<string>();
         public readonly List<string> missingNotes = new List<string>();
+        // 按 GUID 记录每个资源的变化详情（如“已移动”“图片内容已改变”“元数据已改变”），供 UI 逐行展示
+        public readonly Dictionary<string, string> detailByGuid = new Dictionary<string, string>(StringComparer.Ordinal);
         public long safeBytes;        // 安全项将写入的备份总字节
         public long restorableBytes;  // 安全项 + 变化项（有备份）合计，供“强制恢复”估算
         public int TotalAssets => safeAssets.Count + changedAssets.Count + missingNotes.Count;
@@ -212,7 +214,23 @@ namespace ComfyUIUpscaler.Editor
             }
         }
 
-        // 异步构建恢复计划：对每个资源做哈希比对分类（安全/变化/缺失），时间分片让出主线程并支持取消
+        // 待哈希项：阶段一在主线程解析好路径与期望哈希，阶段二在后台线程池并行计算比对
+        private sealed class RestoreHashJob
+        {
+            public TextureAssetInfo asset;
+            public string currentAssetPath;
+            public string fullPath;
+            public string metaPath;
+            public string expectedImgSha;
+            public string expectedMetaSha;
+            public string movePrefix;
+            public long backupBytes;
+            public bool moved;
+            public bool imgMatch;
+            public bool metaMatch;
+        }
+
+        // 异步构建恢复计划：主线程解析路径与非哈希分类 → 后台线程池并行哈希比对(带缓存) → 主线程汇总
         public static async Task<RestorePlan> BuildRestorePlanAsync(
             string directory,
             Action<float, string> progress,
@@ -229,17 +247,23 @@ namespace ComfyUIUpscaler.Editor
                 .ToDictionary(g => g.Key, g => g.Last(), StringComparer.Ordinal);
 
             List<TextureAssetInfo> assets = manifest.assets ?? new List<TextureAssetInfo>();
+
+            // 阶段一（主线程）：解析 GUID→路径、备份/文件是否就绪；非哈希分支就地分类，其余收集为待哈希项
+            var hashJobs = new List<RestoreHashJob>();
             var sliceWatch = System.Diagnostics.Stopwatch.StartNew();
             for (int i = 0; i < assets.Count; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                ClassifyForRestore(directory, assets[i], placements, plan);
+                RestoreHashJob job = PrepareRestoreItem(directory, assets[i], placements, plan);
+                if (job != null)
+                    hashJobs.Add(job);
 
                 bool last = i == assets.Count - 1;
                 if (sliceWatch.ElapsedMilliseconds >= 30 || last)
                 {
-                    progress?.Invoke(assets.Count == 0 ? 1f : (float)(i + 1) / assets.Count,
-                        $"校验可恢复项 {i + 1}/{assets.Count}");
+                    // 阶段一占进度前 5%
+                    progress?.Invoke(assets.Count == 0 ? 0.05f : 0.05f * (i + 1) / assets.Count,
+                        $"解析资源 {i + 1}/{assets.Count}");
                     if (!last)
                     {
                         await Task.Yield();
@@ -247,24 +271,72 @@ namespace ComfyUIUpscaler.Editor
                     }
                 }
             }
+
+            // 阶段二（后台线程池并行）：计算图片/元数据哈希并比对；哈希结果按(路径,大小,修改时间)缓存
+            if (hashJobs.Count > 0)
+            {
+                int total = hashJobs.Count;
+                int done = 0;
+                Task hashTask = Task.Run(() =>
+                {
+                    var options = new ParallelOptions { CancellationToken = cancellationToken };
+                    Parallel.ForEach(hashJobs, options, job =>
+                    {
+                        job.imgMatch = string.Equals(
+                            UpgradeHashUtility.ComputeFileSha256Cached(job.fullPath),
+                            job.expectedImgSha, StringComparison.OrdinalIgnoreCase);
+                        job.metaMatch = string.Equals(
+                            UpgradeHashUtility.ComputeFileSha256Cached(job.metaPath),
+                            job.expectedMetaSha, StringComparison.OrdinalIgnoreCase);
+                        Interlocked.Increment(ref done);
+                    });
+                }, cancellationToken);
+
+                // 主线程轮询上报进度（await 续体回到主线程，调用 progress 安全）
+                while (!hashTask.IsCompleted)
+                {
+                    progress?.Invoke(0.05f + 0.95f * done / total, $"并行校验哈希 {done}/{total}");
+                    await Task.Delay(80, cancellationToken);
+                }
+                await hashTask;  // 传播并行阶段的异常/取消
+            }
+
+            // 阶段三（主线程）：按哈希结果汇总为安全/变化，并写入逐行变化详情
+            foreach (RestoreHashJob job in hashJobs)
+                FinalizeHashJob(job, plan);
+
+            progress?.Invoke(1f, "校验完成");
             return plan;
         }
 
-        // 单资源分类：安全=当前图片/元数据仍与任务输出哈希一致；变化=哈希不符；缺失=GUID/备份/文件缺失
-        private static void ClassifyForRestore(
+        // 阶段一：主线程解析并对非哈希分支就地分类；需要哈希的返回待办项(null 表示已就地处理)
+        private static RestoreHashJob PrepareRestoreItem(
             string directory,
             TextureAssetInfo asset,
             IReadOnlyDictionary<string, AtlasPlacement> placements,
             RestorePlan plan)
         {
             if (asset == null)
-                return;
+                return null;
+
+            void SetDetail(string detail)
+            {
+                if (!string.IsNullOrEmpty(asset.guid))
+                    plan.detailByGuid[asset.guid] = detail;
+            }
+
             string currentAssetPath = AssetDatabase.GUIDToAssetPath(asset.guid);
             if (string.IsNullOrEmpty(currentAssetPath))
             {
+                SetDetail("资源已删除或 GUID 失效");
                 plan.missingNotes.Add(asset.assetPath + "：GUID 对应资源不存在");
-                return;
+                return null;
             }
+
+            // 移动检测：GUID 仍在，但当前路径与任务记录的路径不同 → 资源被移动/改名
+            bool moved = !string.IsNullOrEmpty(asset.assetPath) &&
+                         !string.Equals(currentAssetPath, asset.assetPath, StringComparison.Ordinal);
+            string movePrefix = moved ? "已移动；" : string.Empty;
 
             string backup = ResolveBackupFile(directory, asset);
             bool backupOk = !string.IsNullOrEmpty(backup) && File.Exists(backup) && File.Exists(backup + ".meta");
@@ -275,43 +347,76 @@ namespace ComfyUIUpscaler.Editor
             }
             if (!backupOk)
             {
+                SetDetail(movePrefix + "备份不完整");
                 plan.missingNotes.Add(currentAssetPath + "：备份不完整，无法恢复");
-                return;
-            }
-
-            void MarkChanged(string note)
-            {
-                plan.changedAssets.Add(asset);
-                plan.changedNotes.Add(note);
-                plan.restorableBytes += backupBytes;
+                return null;
             }
 
             if (!placements.TryGetValue(asset.assetPath, out AtlasPlacement placement) ||
                 string.IsNullOrEmpty(placement.outputSha256) || string.IsNullOrEmpty(placement.outputMetaSha256))
             {
-                MarkChanged(currentAssetPath + "：任务缺少输出哈希，无法确认一致性");
-                return;
+                plan.changedAssets.Add(asset);
+                plan.changedNotes.Add(currentAssetPath + "：任务缺少输出哈希，无法确认一致性");
+                plan.restorableBytes += backupBytes;
+                SetDetail(movePrefix + "缺少输出哈希，无法确认");
+                return null;
             }
             string fullPath = TextureScanner.AssetPathToFullPath(currentAssetPath);
             string metaPath = fullPath + ".meta";
             if (!File.Exists(fullPath) || !File.Exists(metaPath))
             {
-                MarkChanged(currentAssetPath + "：当前图片或 .meta 不存在");
-                return;
-            }
-            bool imgMatch = string.Equals(UpgradeHashUtility.ComputeFileSha256(fullPath), placement.outputSha256,
-                StringComparison.OrdinalIgnoreCase);
-            bool metaMatch = string.Equals(UpgradeHashUtility.ComputeFileSha256(metaPath), placement.outputMetaSha256,
-                StringComparison.OrdinalIgnoreCase);
-            if (imgMatch && metaMatch)
-            {
-                plan.safeAssets.Add(asset);
-                plan.safeBytes += backupBytes;
+                plan.changedAssets.Add(asset);
+                plan.changedNotes.Add(currentAssetPath + "：当前图片或 .meta 不存在");
                 plan.restorableBytes += backupBytes;
+                SetDetail(movePrefix + "当前图片或 .meta 缺失");
+                return null;
+            }
+
+            return new RestoreHashJob
+            {
+                asset = asset,
+                currentAssetPath = currentAssetPath,
+                fullPath = fullPath,
+                metaPath = metaPath,
+                expectedImgSha = placement.outputSha256,
+                expectedMetaSha = placement.outputMetaSha256,
+                movePrefix = movePrefix,
+                backupBytes = backupBytes,
+                moved = moved
+            };
+        }
+
+        // 阶段三：根据并行得到的图片/元数据哈希匹配结果，把待办项归入安全/变化并写详情
+        private static void FinalizeHashJob(RestoreHashJob job, RestorePlan plan)
+        {
+            void SetDetail(string detail)
+            {
+                if (!string.IsNullOrEmpty(job.asset.guid))
+                    plan.detailByGuid[job.asset.guid] = detail;
+            }
+
+            if (job.imgMatch && job.metaMatch)
+            {
+                plan.safeAssets.Add(job.asset);
+                plan.safeBytes += job.backupBytes;
+                plan.restorableBytes += job.backupBytes;
+                // 内容一致；仅在移动时给出提示，未移动则无详情
+                SetDetail(job.moved ? "已移动（内容一致）" : string.Empty);
             }
             else
             {
-                MarkChanged(currentAssetPath + "：任务完成后已变化");
+                // 依据图片/元数据哈希细分变化来源，回答“资源变了还是位置变了”
+                string what;
+                if (!job.imgMatch && !job.metaMatch)
+                    what = "图片与元数据均已改变";
+                else if (!job.imgMatch)
+                    what = "图片内容已改变";
+                else
+                    what = "元数据(.meta)已改变";
+                plan.changedAssets.Add(job.asset);
+                plan.changedNotes.Add(job.currentAssetPath + "：任务完成后已变化");
+                plan.restorableBytes += job.backupBytes;
+                SetDetail(job.movePrefix + what);
             }
         }
 
