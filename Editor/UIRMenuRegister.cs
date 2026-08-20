@@ -57,5 +57,11 @@ namespace UIR.EditorTools
         {
             ArtUISpriteAtlasSyncWindow.Open();
         }
+
+        [MenuItem("UIR/同名图片查找合并", false, 305)]
+        private static void Menu_SameNameImageFinder()
+        {
+            SameNameImageFinderWindow.Open();
+        }
     }
 }
