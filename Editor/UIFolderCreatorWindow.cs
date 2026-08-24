@@ -25,11 +25,23 @@ namespace UIR.EditorTools
             "Assets/GameAssets/Art/UI/SpriteAtlas/Sprite"
         };
 
+        /// <summary>单个根目录的创建模式</summary>
+        private enum CreateMode
+        {
+            // 逐层嵌套，子层使用纯名字：Root/UI_Alliance/War/Reward
+            Nested,
+
+            // 平铺在根目录，使用完整语义名：Root/UI_Alliance、Root/UI_Alliance_War、Root/UI_Alliance_War_Reward
+            FullSemantic
+        }
+
         // ==================== EditorPrefs 键 ====================
 
         private const string PrefKeySystem = "UIFolderCreator.System";
         private const string PrefKeyHierarchy = "UIFolderCreator.Hierarchy";
         private const string PrefKeyHistory = "UIFolderCreator.History";
+        private const string PrefKeyRoots = "UIFolderCreator.Roots";
+        private const string PrefKeyRootModes = "UIFolderCreator.RootModes";
 
         /// <summary>Hierarchy / History 在 EditorPrefs 中的分隔符（换行不会出现在合法名称里）</summary>
         private const char PrefListSeparator = '\n';
@@ -47,6 +59,12 @@ namespace UIR.EditorTools
 
         /// <summary>最近使用过的系统名历史记录</summary>
         private readonly List<string> _history = new List<string>();
+
+        /// <summary>各根目录是否参与创建，索引与 RootFolders 一一对应，默认全部开启</summary>
+        private bool[] _rootEnabled;
+
+        /// <summary>各根目录的创建模式，索引与 RootFolders 一一对应，默认 Nested</summary>
+        private CreateMode[] _rootMode;
 
         private Vector2 _scroll;
 
@@ -82,6 +100,9 @@ namespace UIR.EditorTools
             EditorGUILayout.Space();
 
             DrawHierarchy();
+            EditorGUILayout.Space();
+
+            DrawRoots();
             EditorGUILayout.Space();
 
             List<string> preview = GenerateFolderNames();
@@ -178,35 +199,71 @@ namespace UIR.EditorTools
             }
         }
 
-        /// <summary>绘制实时预览</summary>
-        private void DrawPreview(List<string> preview)
+        /// <summary>绘制根目录列表：每个根目录可单独勾选是否创建，并单独选择创建模式</summary>
+        private void DrawRoots()
+        {
+            EnsureRootArrays();
+
+            EditorGUILayout.LabelField("Roots", EditorStyles.boldLabel);
+
+            for (int i = 0; i < RootFolders.Length; i++)
+            {
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    _rootEnabled[i] = EditorGUILayout.ToggleLeft(
+                        new GUIContent(GetRootLabel(RootFolders[i]), RootFolders[i]),
+                        _rootEnabled[i],
+                        GUILayout.Width(140f));
+
+                    // 未勾选时禁用模式选择
+                    using (new EditorGUI.DisabledScope(!_rootEnabled[i]))
+                    {
+                        _rootMode[i] = (CreateMode)EditorGUILayout.EnumPopup(_rootMode[i]);
+                    }
+                }
+            }
+
+            if (!AnyRootEnabled())
+            {
+                EditorGUILayout.HelpBox("至少勾选一个根目录才能创建。", MessageType.Warning);
+            }
+        }
+
+        /// <summary>绘制实时预览：按每个已勾选根目录及其模式分组展示</summary>
+        private void DrawPreview(List<string> segments)
         {
             EditorGUILayout.LabelField("Preview", EditorStyles.boldLabel);
 
-            if (preview.Count == 0)
+            if (segments.Count == 0)
             {
                 EditorGUILayout.HelpBox("请填写 System Name。", MessageType.Info);
                 return;
             }
 
-            EditorGUILayout.TextArea(string.Join("\n", preview), GUILayout.MinHeight(80f));
+            if (!AnyRootEnabled())
+            {
+                EditorGUILayout.HelpBox("请至少勾选一个根目录。", MessageType.Info);
+                return;
+            }
+
+            EditorGUILayout.TextArea(BuildPreviewText(segments), GUILayout.MinHeight(80f));
         }
 
         /// <summary>绘制操作按钮</summary>
-        private void DrawButtons(List<string> preview)
+        private void DrawButtons(List<string> segments)
         {
-            using (new EditorGUI.DisabledScope(preview.Count == 0))
+            using (new EditorGUI.DisabledScope(segments.Count == 0 || !AnyRootEnabled()))
             {
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     if (GUILayout.Button("Copy Preview", GUILayout.Height(28f)))
                     {
-                        EditorGUIUtility.systemCopyBuffer = string.Join("\n", preview);
+                        EditorGUIUtility.systemCopyBuffer = BuildPreviewText(segments);
                     }
 
                     if (GUILayout.Button("Create", GUILayout.Height(28f)))
                     {
-                        CreateFolders(preview);
+                        CreateFolders(segments);
                     }
                 }
             }
@@ -215,8 +272,9 @@ namespace UIR.EditorTools
         // ==================== 命名逻辑 ====================
 
         /// <summary>
-        /// 生成从第一层到最后一层的目录名列表
+        /// 生成层级分段列表（Nested 模式直接使用）
         /// 规则：第一层固定 UI_完整系统名；第二层起每层直接使用各自的纯名字
+        /// 例如 [UI_Alliance, War, Reward]
         /// </summary>
         private List<string> GenerateFolderNames()
         {
@@ -244,6 +302,75 @@ namespace UIR.EditorTools
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// 由分段列表构造完整语义名列表（FullSemantic 模式使用）
+        /// 逐段用下划线累积，例如 [UI_Alliance, War, Reward] -> [UI_Alliance, UI_Alliance_War, UI_Alliance_War_Reward]
+        /// </summary>
+        private static List<string> BuildFullSemanticNames(List<string> segments)
+        {
+            var result = new List<string>(segments.Count);
+            string cumulative = null;
+            foreach (string seg in segments)
+            {
+                cumulative = cumulative == null ? seg : cumulative + "_" + seg;
+                result.Add(cumulative);
+            }
+
+            return result;
+        }
+
+        /// <summary>构造预览文本：按每个已勾选根目录及其模式分组</summary>
+        private string BuildPreviewText(List<string> segments)
+        {
+            var full = BuildFullSemanticNames(segments);
+            var sb = new StringBuilder();
+
+            bool firstGroup = true;
+            for (int i = 0; i < RootFolders.Length; i++)
+            {
+                if (!_rootEnabled[i])
+                {
+                    continue;
+                }
+
+                if (!firstGroup)
+                {
+                    sb.AppendLine();
+                }
+
+                firstGroup = false;
+
+                sb.AppendLine(GetRootLabel(RootFolders[i]) + "  [" + ModeLabel(_rootMode[i]) + "]");
+
+                if (_rootMode[i] == CreateMode.Nested)
+                {
+                    // 嵌套模式：按 / 逐层展示相对路径
+                    string cumulative = null;
+                    foreach (string seg in segments)
+                    {
+                        cumulative = cumulative == null ? seg : cumulative + "/" + seg;
+                        sb.AppendLine("  " + cumulative);
+                    }
+                }
+                else
+                {
+                    // 完整语义模式：各完整名平铺在根目录下
+                    foreach (string name in full)
+                    {
+                        sb.AppendLine("  " + name);
+                    }
+                }
+            }
+
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>创建模式的显示名</summary>
+        private static string ModeLabel(CreateMode mode)
+        {
+            return mode == CreateMode.Nested ? "Nested" : "Full Semantic";
         }
 
         /// <summary>
@@ -285,51 +412,56 @@ namespace UIR.EditorTools
 
         // ==================== 目录创建 ====================
 
-        /// <summary>按预览名列表在每个根目录下镜像创建目录树</summary>
-        private void CreateFolders(List<string> names)
+        /// <summary>按每个已勾选根目录各自的模式创建目录</summary>
+        private void CreateFolders(List<string> segments)
         {
-            if (names == null || names.Count == 0)
+            if (segments == null || segments.Count == 0)
             {
                 return;
             }
 
+            EnsureRootArrays();
+            if (!AnyRootEnabled())
+            {
+                return;
+            }
+
+            var full = BuildFullSemanticNames(segments);
             var created = new List<string>();
             var existed = new List<string>();
-            string lastFolderOfFirstRoot = null;
+            string deepestFolderOfFirstEnabledRoot = null;
 
             AssetDatabase.StartAssetEditing();
             try
             {
                 for (int r = 0; r < RootFolders.Length; r++)
                 {
+                    // 跳过未勾选的根目录
+                    if (!_rootEnabled[r])
+                    {
+                        continue;
+                    }
+
                     string root = RootFolders[r];
                     string label = GetRootLabel(root);
 
                     // 确保根目录本身存在
                     EnsureFolderPath(root);
 
-                    string parent = root;
-                    foreach (string name in names)
+                    string deepest;
+                    if (_rootMode[r] == CreateMode.Nested)
                     {
-                        bool wasCreated = EnsureFolder(parent, name);
-                        string full = parent + "/" + name;
-
-                        if (wasCreated)
-                        {
-                            created.Add(label + "/" + name);
-                        }
-                        else
-                        {
-                            existed.Add(label + "/" + name);
-                        }
-
-                        parent = full;
+                        deepest = CreateNested(root, label, segments, created, existed);
+                    }
+                    else
+                    {
+                        deepest = CreateFullSemantic(root, label, full, created, existed);
                     }
 
-                    // 记录首个根目录最深一级，用于创建后选中
-                    if (r == 0)
+                    // 记录首个已勾选根目录的最深一级，用于创建后选中
+                    if (deepestFolderOfFirstEnabledRoot == null)
                     {
-                        lastFolderOfFirstRoot = parent;
+                        deepestFolderOfFirstEnabledRoot = deepest;
                     }
                 }
             }
@@ -345,16 +477,55 @@ namespace UIR.EditorTools
 
             LogResult(created, existed);
 
-            // 自动选中首个根目录下最深一级目录
-            if (!string.IsNullOrEmpty(lastFolderOfFirstRoot))
+            // 自动选中首个已勾选根目录下最深一级目录
+            if (!string.IsNullOrEmpty(deepestFolderOfFirstEnabledRoot))
             {
-                var obj = AssetDatabase.LoadAssetAtPath<Object>(lastFolderOfFirstRoot);
+                var obj = AssetDatabase.LoadAssetAtPath<Object>(deepestFolderOfFirstEnabledRoot);
                 if (obj != null)
                 {
                     Selection.activeObject = obj;
                     EditorGUIUtility.PingObject(obj);
                 }
             }
+        }
+
+        /// <summary>
+        /// Nested 模式：在 root 下逐层嵌套创建各分段目录
+        /// 返回最深一级目录的完整路径
+        /// </summary>
+        private static string CreateNested(string root, string label, List<string> segments,
+            List<string> created, List<string> existed)
+        {
+            string parent = root;
+            foreach (string seg in segments)
+            {
+                bool wasCreated = EnsureFolder(parent, seg);
+                parent += "/" + seg;
+
+                // 日志显示根目录下的相对路径，例如 Prefab/UI_Alliance/War
+                string relative = parent.Substring(root.Length + 1);
+                (wasCreated ? created : existed).Add(label + "/" + relative);
+            }
+
+            return parent;
+        }
+
+        /// <summary>
+        /// FullSemantic 模式：将各完整语义名平铺创建在 root 下（互为同级）
+        /// 返回最深（最后一个）完整名目录的完整路径
+        /// </summary>
+        private static string CreateFullSemantic(string root, string label, List<string> fullNames,
+            List<string> created, List<string> existed)
+        {
+            string deepest = root;
+            foreach (string name in fullNames)
+            {
+                bool wasCreated = EnsureFolder(root, name);
+                deepest = root + "/" + name;
+                (wasCreated ? created : existed).Add(label + "/" + name);
+            }
+
+            return deepest;
         }
 
         /// <summary>
@@ -393,6 +564,49 @@ namespace UIR.EditorTools
                 EnsureFolder(parent, parts[i]);
                 parent += "/" + parts[i];
             }
+        }
+
+        /// <summary>确保勾选/模式数组已初始化且长度与 RootFolders 一致（新增根目录默认：开启 + Nested）</summary>
+        private void EnsureRootArrays()
+        {
+            if (_rootEnabled == null || _rootEnabled.Length != RootFolders.Length)
+            {
+                var resized = new bool[RootFolders.Length];
+                for (int i = 0; i < resized.Length; i++)
+                {
+                    // 沿用已有值，超出部分默认开启
+                    resized[i] = _rootEnabled != null && i < _rootEnabled.Length ? _rootEnabled[i] : true;
+                }
+
+                _rootEnabled = resized;
+            }
+
+            if (_rootMode == null || _rootMode.Length != RootFolders.Length)
+            {
+                var resized = new CreateMode[RootFolders.Length];
+                for (int i = 0; i < resized.Length; i++)
+                {
+                    // 沿用已有值，超出部分默认 Nested
+                    resized[i] = _rootMode != null && i < _rootMode.Length ? _rootMode[i] : CreateMode.Nested;
+                }
+
+                _rootMode = resized;
+            }
+        }
+
+        /// <summary>是否至少勾选了一个根目录</summary>
+        private bool AnyRootEnabled()
+        {
+            EnsureRootArrays();
+            for (int i = 0; i < _rootEnabled.Length; i++)
+            {
+                if (_rootEnabled[i])
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>取根目录用于日志显示的短标签（末级目录名）</summary>
@@ -495,6 +709,28 @@ namespace UIR.EditorTools
                     }
                 }
             }
+
+            LoadRootSettings();
+        }
+
+        /// <summary>从 EditorPrefs 恢复根目录勾选与模式（无记录或长度不足时用默认：开启 + Nested）</summary>
+        private void LoadRootSettings()
+        {
+            _rootEnabled = new bool[RootFolders.Length];
+            // 勾选：以 '1'/'0' 字符序列保存，索引与 RootFolders 对应
+            string flags = EditorPrefs.GetString(PrefKeyRoots, string.Empty);
+            for (int i = 0; i < _rootEnabled.Length; i++)
+            {
+                _rootEnabled[i] = i < flags.Length ? flags[i] == '1' : true;
+            }
+
+            _rootMode = new CreateMode[RootFolders.Length];
+            // 模式：'1' 表示 FullSemantic，其余（含缺省）为 Nested
+            string modes = EditorPrefs.GetString(PrefKeyRootModes, string.Empty);
+            for (int i = 0; i < _rootMode.Length; i++)
+            {
+                _rootMode[i] = i < modes.Length && modes[i] == '1' ? CreateMode.FullSemantic : CreateMode.Nested;
+            }
         }
 
         /// <summary>将当前输入写入 EditorPrefs</summary>
@@ -503,6 +739,18 @@ namespace UIR.EditorTools
             EditorPrefs.SetString(PrefKeySystem, _systemName ?? string.Empty);
             EditorPrefs.SetString(PrefKeyHierarchy, string.Join(PrefListSeparator.ToString(), _hierarchy));
             EditorPrefs.SetString(PrefKeyHistory, string.Join(PrefListSeparator.ToString(), _history));
+
+            EnsureRootArrays();
+            var flags = new StringBuilder(_rootEnabled.Length);
+            var modes = new StringBuilder(_rootMode.Length);
+            for (int i = 0; i < _rootEnabled.Length; i++)
+            {
+                flags.Append(_rootEnabled[i] ? '1' : '0');
+                modes.Append(_rootMode[i] == CreateMode.FullSemantic ? '1' : '0');
+            }
+
+            EditorPrefs.SetString(PrefKeyRoots, flags.ToString());
+            EditorPrefs.SetString(PrefKeyRootModes, modes.ToString());
         }
     }
 }
