@@ -2,7 +2,9 @@
   "name": "ComfyUIUpscaler.Editor.Tests",
   "rootNamespace": "ComfyUIUpscaler.Editor.Tests",
   "references": [
-    "ComfyUIUpscaler.Editor"
+    "ComfyUIUpscaler.Editor",
+    "UnityEditor.UI",
+    "UnityEngine.UI"
   ],
   "includePlatforms": [
     "Editor"

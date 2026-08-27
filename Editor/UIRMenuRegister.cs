@@ -1,5 +1,6 @@
 using UnityEditor;
 using UIR.EditorTools.Svn;
+using UIR.EditorTools.Git;
 using ComfyUIUpscaler.Editor;
 
 namespace UIR.EditorTools
@@ -22,6 +23,20 @@ namespace UIR.EditorTools
         private static void Menu_SvnUpdate()
         {
             SvnTools.UpdateProject();
+        }
+
+        // ==================== Git 工具（UGit） ====================
+
+        [MenuItem("UIR/Git 提交资源", false, 102)]
+        private static void Menu_GitCommit()
+        {
+            GitTools.CommitGameAssets();
+        }
+
+        [MenuItem("UIR/Git 更新工程", false, 103)]
+        private static void Menu_GitUpdate()
+        {
+            GitTools.UpdateProject();
         }
 
         // ==================== UI 工具 ====================
