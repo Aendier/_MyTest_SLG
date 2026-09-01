@@ -1,0 +1,25 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c80e441a891836c4aa0b84c6d4a61b28, type: 3}
+  m_Name: ImageImportSettingsConfig
+  m_EditorClassIdentifier: 
+  Enabled: 1
+  Rules:
+  - RuleName: "UI\u56FE\u7247\u8D44\u6E90\u8BBE\u7F6E"
+    Folders:
+    - {fileID: 102900000, guid: a5ac0a382a5ebea46ac5f79b1eca1dc0, type: 3}
+    - {fileID: 102900000, guid: 31f995283310e4f4a841621a3a0173a7, type: 3}
+    - {fileID: 102900000, guid: d588f35a6c24b8042a833dc0ac674d09, type: 3}
+    - {fileID: 102900000, guid: 11529c8372260334bbcdb9c31531bce0, type: 3}
+    Preset: {fileID: 2655988077585873504, guid: 6a3a045a6100da242a138806a1d8d4e0,
+      type: 2}
+    IncludeSubfolders: 1

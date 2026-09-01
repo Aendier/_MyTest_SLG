@@ -78,5 +78,11 @@ namespace UIR.EditorTools
         {
             SameNameImageFinderWindow.Open();
         }
+
+        [MenuItem("UIR/图片导入设置统一工具", false, 304)]
+        private static void Menu_ImageImportSettings()
+        {
+            ImageImportSettingsWindow.Open();
+        }
     }
 }
