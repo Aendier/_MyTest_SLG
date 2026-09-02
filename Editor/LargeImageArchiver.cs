@@ -23,6 +23,15 @@ namespace UIR.EditorTools
             BothExceed,    // 宽和高都超过阈值
         }
 
+        /// <summary>
+        /// 目标目录的层级格式，与 UIFolderCreatorWindow 的创建模式对应。
+        /// </summary>
+        private enum FolderPathMode
+        {
+            Nested,       // 保持相对目录层级：UI_X/Child/file.png
+            FullSemantic, // 将相对目录层级拼成语义目录：UI_X_Child/file.png
+        }
+
         // 源文件夹与目标文件夹（限定为工程内文件夹）
         private DefaultAsset _sourceFolder;
         private DefaultAsset _targetFolder;
@@ -30,6 +39,7 @@ namespace UIR.EditorTools
         // 像素阈值与判定模式
         private int _pixelThreshold = 1024;
         private SizeMode _sizeMode = SizeMode.EitherExceeds;
+        private FolderPathMode _targetPathMode = FolderPathMode.Nested;
 
         // 预览结果缓存
         private readonly List<PreviewItem> _previewItems = new List<PreviewItem>();
@@ -59,6 +69,7 @@ namespace UIR.EditorTools
         {
             EditorGUILayout.HelpBox(
                 "将【源文件夹】内像素尺寸超过阈值的图片，移动到【目标文件夹】，并保持相同的目录层级。\n" +
+                "目标目录格式需与 UIFolderCreator 保持一致；Full Semantic 会将目录段合并为下划线。\n" +
                 "移动使用 AssetDatabase.MoveAsset，保留 GUID 与引用关系。",
                 MessageType.Info);
 
@@ -78,6 +89,11 @@ namespace UIR.EditorTools
                 "判定条件",
                 (int)_sizeMode,
                 new[] { "宽或高任一超过阈值", "宽和高都超过阈值" });
+
+            _targetPathMode = (FolderPathMode)EditorGUILayout.Popup(
+                "目标目录格式",
+                (int)_targetPathMode,
+                new[] { "Nested（保持层级）", "Full Semantic（下划线合并层级）" });
 
             EditorGUILayout.Space();
 
@@ -121,7 +137,12 @@ namespace UIR.EditorTools
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     EditorGUILayout.LabelField($"{item.Width}x{item.Height}", GUILayout.Width(90f));
-                    EditorGUILayout.LabelField(item.AssetPath, EditorStyles.miniLabel);
+                    string destination = sourceValid && targetValid
+                        ? BuildDestinationPath(item.AssetPath, sourcePath, targetPath)
+                        : string.Empty;
+                    EditorGUILayout.LabelField(
+                        string.IsNullOrEmpty(destination) ? item.AssetPath : item.AssetPath + "  →  " + destination,
+                        EditorStyles.miniLabel);
                 }
             }
             EditorGUILayout.EndScrollView();
@@ -174,7 +195,7 @@ namespace UIR.EditorTools
         }
 
         /// <summary>
-        /// 执行移动：保持相对层级，将命中图片移动到目标文件夹。
+        /// 执行移动：按目标目录格式，将命中图片移动到目标文件夹。
         /// </summary>
         private void ExecuteMove(string sourcePath, string targetPath)
         {
@@ -198,9 +219,7 @@ namespace UIR.EditorTools
                     EditorUtility.DisplayProgressBar("移动图片", assetPath,
                         _previewItems.Count > 0 ? (float)i / _previewItems.Count : 1f);
 
-                    // 计算相对源文件夹的相对路径，拼出目标路径以保持层级一致
-                    string relative = assetPath.Substring(sourcePath.Length + 1);
-                    string destPath = targetPath + "/" + relative;
+                    string destPath = BuildDestinationPath(assetPath, sourcePath, targetPath);
                     string destDir = Path.GetDirectoryName(destPath).Replace("\\", "/");
 
                     EnsureFolder(destDir);
@@ -243,6 +262,30 @@ namespace UIR.EditorTools
 
             // 移动后清空预览，避免路径失效
             _previewItems.Clear();
+        }
+
+        /// <summary>
+        /// 根据目标目录格式，将源资源映射到目标路径。
+        /// Full Semantic 会把相对路径中的目录段合并为一个下划线语义目录，
+        /// 文件名及其后的文件层级保持不变。
+        /// </summary>
+        private string BuildDestinationPath(string assetPath, string sourcePath, string targetPath)
+        {
+            string relative = assetPath.Substring(sourcePath.Length + 1).Replace("\\", "/");
+            if (_targetPathMode == FolderPathMode.Nested)
+            {
+                return targetPath + "/" + relative;
+            }
+
+            string[] parts = relative.Split('/');
+            if (parts.Length <= 1)
+            {
+                return targetPath + "/" + relative;
+            }
+
+            // 最后一段是文件名；其余段是目录层级，按 FullSemantic 规则合并。
+            string semanticFolder = string.Join("_", parts, 0, parts.Length - 1);
+            return targetPath + "/" + semanticFolder + "/" + parts[parts.Length - 1];
         }
 
         /// <summary>
