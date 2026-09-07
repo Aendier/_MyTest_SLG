@@ -69,6 +69,7 @@ namespace UIR.EditorTools
             "m_SpritePivot.x",
             "m_SpritePivot.y",
             "m_SpritePixelsToUnits",
+            "m_SpriteMode",
             "m_SpriteSheet",
             "m_SpriteMeshType",
             "m_Alignment",
@@ -172,7 +173,7 @@ namespace UIR.EditorTools
             if (rule == null || rule.Preset == null)
                 return;
 
-            // 统一写入纹理类型和 Advanced 设置，并保留图片自身的 Sprite Border。
+            // 统一写入预设中的通用设置，并保留每张图片独立维护的 Sprite 设置。
             ImageImportSettingsConfig.ApplyPreset((TextureImporter)assetImporter, rule.Preset);
         }
 

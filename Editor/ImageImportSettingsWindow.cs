@@ -32,7 +32,7 @@ namespace UIR.EditorTools
         }
 
         [Button("应用到已有图片（自动保存）", ButtonSizes.Large), PropertyOrder(1)]
-        [InfoBox("应用预设时会忽略以下内容：Sprite Border、Sprite Pivot、Pixels Per Unit、Sprite Sheet、Sprite Mesh Type、Alignment、Physics Shape、Tessellation Detail、Wrap Mode、平台设置。", InfoMessageType.Info)]
+        [InfoBox("应用预设时会忽略以下内容：Sprite Mode、Sprite Border、Sprite Pivot、Pixels Per Unit、Sprite Sheet、Sprite Mesh Type、Alignment、Physics Shape、Tessellation Detail、Wrap Mode、平台设置。", InfoMessageType.Info)]
         [GUIColor(0.35f, 0.8f, 0.45f)]
         private void ApplyToExistingImages()
         {
