@@ -102,6 +102,12 @@ namespace UIR.EditorTools
 
         public static void QueueScan(string reason)
         {
+            if (EditorApplication.isCompiling || _isScanning || ManualScanRunning) return;
+            ScheduleScan(reason);
+        }
+
+        private static void ScheduleScan(string reason)
+        {
             if (_isScanning || ManualScanRunning) return;
             _scanQueued = true;
             _scanAt = EditorApplication.timeSinceStartup + DebounceSeconds;
@@ -124,7 +130,7 @@ namespace UIR.EditorTools
         [DidReloadScripts]
         private static void OnScriptsReloaded()
         {
-            QueueScan("脚本编译完成");
+            ScheduleScan("脚本编译完成");
         }
 
         private static void OnProjectChanged()
@@ -140,6 +146,8 @@ namespace UIR.EditorTools
 
         private static void Update()
         {
+            if (EditorApplication.isCompiling) return;
+
             if (_isScanning)
             {
                 ProcessBatch();
@@ -223,7 +231,7 @@ namespace UIR.EditorTools
             return true;
         }
 
-        private static void FinishScan(bool cancelled, bool failed = false)
+        private static void FinishScan(bool cancelled, bool failed = false, bool removeProgress = false)
         {
             int scanned = _index;
             int total = _paths != null ? _paths.Length : 0;
@@ -231,7 +239,12 @@ namespace UIR.EditorTools
             string reason = _reason;
 
             if (_progressId >= 0)
-                Progress.Finish(_progressId, cancelled || failed ? Progress.Status.Canceled : Progress.Status.Succeeded);
+            {
+                if (removeProgress)
+                    Progress.Remove(_progressId, true);
+                else
+                    Progress.Finish(_progressId, cancelled || failed ? Progress.Status.Canceled : Progress.Status.Succeeded);
+            }
             if (_scanConfig != null)
                 UnityEngine.Object.DestroyImmediate(_scanConfig);
 
@@ -243,7 +256,7 @@ namespace UIR.EditorTools
             _cancelRequested = false;
             _isScanning = false;
 
-            if (failed) return;
+            if (failed || removeProgress) return;
             if (cancelled)
                 Debug.Log($"[资源合法性检查] 自动扫描已取消（{reason}）：已处理 {scanned}/{total} 个资源路径，发现 {warnings} 条报警。");
             else if (warnings > 0)
@@ -254,7 +267,7 @@ namespace UIR.EditorTools
         {
             _scanQueued = false;
             if (_isScanning)
-                FinishScan(true);
+                FinishScan(true, false, true);
         }
 
         private static bool HasImageRules(ResourceValidationConfig config)
@@ -278,7 +291,7 @@ namespace UIR.EditorTools
             bool nameRule = config.CheckChineseNames;
             if (nameRule && ContainsChineseAssetName(assetPath))
             {
-                LogWarning("name|" + assetPath, "[资源合法性检查] 资源命名包含中文：" + assetPath, assetPath);
+                LogIssue("name|" + assetPath, "[资源合法性检查] 资源命名包含中文：" + assetPath, assetPath, true);
                 warnings++;
             }
             warnings += ValidateImageSize(assetPath, config);
@@ -304,28 +317,39 @@ namespace UIR.EditorTools
                 if (texture != null && ((matched.MaxWidth > 0 && texture.width >= matched.MaxWidth) ||
                                         (matched.MaxHeight > 0 && texture.height >= matched.MaxHeight)))
                 {
-                    LogWarning("size|" + assetPath, $"[资源合法性检查] 图片尺寸达到或超过规则：{assetPath} ({texture.width}x{texture.height}，阈值 {FormatLimit(matched)})", assetPath);
+                    LogIssue("size|" + assetPath, $"[资源合法性检查] 图片尺寸达到或超过规则：{assetPath} ({texture.width}x{texture.height}，阈值 {FormatLimit(matched)})", assetPath, false);
                     return 1;
                 }
             }
             return 0;
         }
 
-        private static readonly Dictionary<string, double> LastWarningTimes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, double> LastIssueTimes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
 
-        private static void LogWarning(string issueKey, string message, string assetPath)
+        private static void LogIssue(string issueKey, string message, string assetPath, bool isError)
         {
             double now = EditorApplication.timeSinceStartup;
-            if (LastWarningTimes.TryGetValue(issueKey, out double lastTime) && now - lastTime < 1d)
+            if (LastIssueTimes.TryGetValue(issueKey, out double lastTime) && now - lastTime < 1d)
                 return;
-            LastWarningTimes[issueKey] = now;
+            LastIssueTimes[issueKey] = now;
 
             // 传入资源对象后，点击 Console 日志会直接选中并定位该资源。
             UnityEngine.Object context = AssetDatabase.LoadMainAssetAtPath(assetPath);
-            if (context != null)
+            if (isError)
+            {
+                if (context != null)
+                    Debug.LogError(message, context);
+                else
+                    Debug.LogError(message);
+            }
+            else if (context != null)
+            {
                 Debug.LogWarning(message, context);
+            }
             else
+            {
                 Debug.LogWarning(message);
+            }
         }
 
         public static bool ContainsChinese(string value)
