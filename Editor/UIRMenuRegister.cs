@@ -84,5 +84,11 @@ namespace UIR.EditorTools
         {
             ImageImportSettingsWindow.Open();
         }
+
+        [MenuItem("UIR/资源合法性检查", false, 306)]
+        private static void Menu_ResourceValidation()
+        {
+            ResourceValidationWindow.Open();
+        }
     }
 }

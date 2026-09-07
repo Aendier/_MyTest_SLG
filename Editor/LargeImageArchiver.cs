@@ -295,9 +295,9 @@ namespace UIR.EditorTools
         {
             if (_sizeMode == SizeMode.BothExceed)
             {
-                return width > _pixelThreshold && height > _pixelThreshold;
+                return width >= _pixelThreshold && height >= _pixelThreshold;
             }
-            return width > _pixelThreshold || height > _pixelThreshold;
+            return width >= _pixelThreshold || height >= _pixelThreshold;
         }
 
         /// <summary>
