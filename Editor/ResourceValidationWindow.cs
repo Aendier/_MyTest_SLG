@@ -30,11 +30,13 @@ namespace UIR.EditorTools
         {
             LoadEditingConfig();
             AssemblyReloadEvents.beforeAssemblyReload += CancelScanForReload;
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
         }
 
         private void OnDisable()
         {
             AssemblyReloadEvents.beforeAssemblyReload -= CancelScanForReload;
+            EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
             CancelScan();
             DestroyEditingConfig();
         }
@@ -49,7 +51,7 @@ namespace UIR.EditorTools
                 EditorGUILayout.HelpBox($"正在扫描：{_scanIndex}/{_scanPaths.Length} 个资源路径，已发现 {_scanWarnings} 条报警。", MessageType.Info);
             _config.Enabled = EditorGUILayout.Toggle("启用自动检查", _config.Enabled);
             _config.CheckChineseNames = EditorGUILayout.Toggle("检查全工程中文命名", _config.CheckChineseNames);
-            EditorGUILayout.HelpBox("导入或移动资源时立即检查对应资源。保存配置、资源刷新、脚本编译完成或进入播放模式后，会在 1 秒无新变化后异步检查规则文件夹中的图片。全量扫描仅由按钮触发。", MessageType.Info);
+            EditorGUILayout.HelpBox("导入或移动资源时立即检查对应资源。保存配置、资源刷新或脚本编译完成后，会在 1 秒无新变化后异步检查规则文件夹中的图片。运行时不会触发扫描，全量扫描仅由按钮触发。", MessageType.Info);
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("文件夹规则", EditorStyles.boldLabel);
             if (_config.Rules == null)
@@ -119,6 +121,11 @@ namespace UIR.EditorTools
         private void StartScan()
         {
             if (_isScanning || _savedConfig == null) return;
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            {
+                EditorUtility.DisplayDialog("运行时不检查", "请退出播放模式后再执行全量扫描。", "确定");
+                return;
+            }
             if (_hasUnsavedChanges)
             {
                 EditorUtility.DisplayDialog("配置尚未保存", "请先点击“保存配置”，再执行全量扫描。", "确定");
@@ -203,6 +210,12 @@ namespace UIR.EditorTools
         private void CancelScanForReload()
         {
             CancelScan();
+        }
+
+        private void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            if (state == PlayModeStateChange.ExitingEditMode)
+                CancelScan();
         }
 
         private void CancelScan()

@@ -58,6 +58,7 @@ namespace UIR.EditorTools
     {
         private static void OnPostprocessAllAssets(string[] imported, string[] deleted, string[] moved, string[] movedFrom)
         {
+            if (EditorApplication.isPlayingOrWillChangePlaymode) return;
             var config = ResourceValidationConfig.Load();
             if (config == null || !config.Enabled) return;
             var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -102,13 +103,13 @@ namespace UIR.EditorTools
 
         public static void QueueScan(string reason)
         {
-            if (EditorApplication.isCompiling || _isScanning || ManualScanRunning) return;
+            if (EditorApplication.isCompiling || EditorApplication.isPlayingOrWillChangePlaymode || _isScanning || ManualScanRunning) return;
             ScheduleScan(reason);
         }
 
         private static void ScheduleScan(string reason)
         {
-            if (_isScanning || ManualScanRunning) return;
+            if (EditorApplication.isPlayingOrWillChangePlaymode || _isScanning || ManualScanRunning) return;
             _scanQueued = true;
             _scanAt = EditorApplication.timeSinceStartup + DebounceSeconds;
             _reason = reason;
@@ -116,7 +117,7 @@ namespace UIR.EditorTools
 
         public static bool TryBeginManualScan()
         {
-            if (_isScanning || ManualScanRunning) return false;
+            if (EditorApplication.isPlayingOrWillChangePlaymode || _isScanning || ManualScanRunning) return false;
             _scanQueued = false;
             ManualScanRunning = true;
             return true;
@@ -140,13 +141,15 @@ namespace UIR.EditorTools
 
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            if (state == PlayModeStateChange.EnteredPlayMode)
-                QueueScan("进入播放模式");
+            if (state != PlayModeStateChange.ExitingEditMode) return;
+            _scanQueued = false;
+            if (_isScanning)
+                FinishScan(true, false, true);
         }
 
         private static void Update()
         {
-            if (EditorApplication.isCompiling) return;
+            if (EditorApplication.isCompiling || EditorApplication.isPlayingOrWillChangePlaymode) return;
 
             if (_isScanning)
             {
