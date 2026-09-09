@@ -18,7 +18,7 @@ namespace UIR.EditorTools
         public List<DefaultAsset> Folders = new List<DefaultAsset>();
 
         [InspectorName("导入预设")]
-        [Tooltip("使用 Unity 原生 TextureImporter Preset；应用时会排除图片独立维护的 Sprite 数据")]
+        [Tooltip("使用 Unity 原生 TextureImporter Preset；已有图片会保留独立维护的 Sprite 数据，新图片沿用 Unity 默认的 Single 模式")]
         public Preset Preset;
 
         [InspectorName("包含子文件夹")]
@@ -121,12 +121,14 @@ namespace UIR.EditorTools
             return config;
         }
 
-        /// <summary>应用原生预设，但排除每张图片独立维护的 Sprite 数据。</summary>
+        /// <summary>应用原生预设；保留已有图片的 Sprite 数据，并为新的 Sprite 图片补齐 Unity 默认的 Single 模式。</summary>
         public static void ApplyPreset(TextureImporter importer, Preset preset)
         {
             if (importer == null || preset == null || !preset.CanBeAppliedTo(importer))
                 return;
 
+            bool importSettingsMissing = importer.importSettingsMissing;
+            SpriteImportMode originalSpriteMode = importer.spriteImportMode;
             var selectedProperties = new List<string>();
             var modifications = preset.PropertyModifications;
             if (modifications == null)
@@ -134,8 +136,10 @@ namespace UIR.EditorTools
 
             foreach (var modification in modifications)
             {
-                if (modification == null || string.IsNullOrEmpty(modification.propertyPath) ||
-                    IsExcludedSpriteProperty(modification.propertyPath))
+                if (modification == null || string.IsNullOrEmpty(modification.propertyPath))
+                    continue;
+
+                if (IsExcludedSpriteProperty(modification.propertyPath))
                     continue;
 
                 selectedProperties.Add(modification.propertyPath);
@@ -143,6 +147,15 @@ namespace UIR.EditorTools
 
             if (selectedProperties.Count > 0)
                 preset.ApplyTo(importer, selectedProperties.ToArray());
+
+            // Sprite Mode is normally kept per image, but a new importer without a meta starts at None.
+            // Restore Unity's default Single mode only for that new asset.
+            if (importSettingsMissing &&
+                originalSpriteMode == SpriteImportMode.None &&
+                importer.textureType == TextureImporterType.Sprite)
+            {
+                importer.spriteImportMode = SpriteImportMode.Single;
+            }
         }
 
         private static bool IsExcludedSpriteProperty(string propertyPath)
@@ -173,7 +186,7 @@ namespace UIR.EditorTools
             if (rule == null || rule.Preset == null)
                 return;
 
-            // 统一写入预设中的通用设置，并保留每张图片独立维护的 Sprite 设置。
+            // 统一写入预设中的通用设置；已有图片保留 Sprite 设置，新 Sprite 使用 Unity 默认 Single。
             ImageImportSettingsConfig.ApplyPreset((TextureImporter)assetImporter, rule.Preset);
         }
 
