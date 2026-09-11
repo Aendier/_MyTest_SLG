@@ -60,7 +60,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     private string progressMessage = string.Empty;
     private float progressValue;
 
-    [MenuItem("Tools/Sprite Asset To PNG")]
+    [MenuItem("UIR/Sprite Asset To PNG")]
     public static void Open()
     {
         GetWindow<SpriteAssetToPngWindow>("Sprite Asset To PNG");

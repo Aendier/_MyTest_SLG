@@ -50,7 +50,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         }
     }
 
-    [MenuItem("Tools/Prefab Image Replacer")]
+    [MenuItem("UIR/Prefab Image Replacer")]
     public static void Open()
     {
         var window = GetWindow<PrefabImageReplacerWindow>("Prefab Image Replacer");
