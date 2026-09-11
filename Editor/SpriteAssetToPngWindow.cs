@@ -25,11 +25,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     private static readonly Regex SerializedSpriteReferenceRegex = new Regex(
         "\\{fileID:\\s*(-?[0-9]+),\\s*guid:\\s*([0-9a-fA-F]{32}),\\s*type:\\s*2\\s*\\}",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly HashSet<string> TextExtensions = new HashSet<string>(
-        new[] { ".asset", ".prefab", ".unity", ".mat", ".anim", ".controller", ".overridecontroller", ".playable",
-            ".cs", ".json", ".xml", ".txt", ".shader", ".compute", ".uss", ".uxml", ".bytes" },
-        StringComparer.OrdinalIgnoreCase);
-
     private string folderPath = DefaultFolder;
     private DefaultAsset folderObject;
     private Vector2 scrollPosition;
@@ -38,7 +33,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     private readonly HashSet<string> previewQueued = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private readonly List<ConversionCandidate> candidates = new List<ConversionCandidate>();
     private readonly List<ScanProblemItem> problemItems = new List<ScanProblemItem>();
-    private readonly List<AtlasInfo> atlases = new List<AtlasInfo>();
     private readonly List<string> scanProblems = new List<string>();
     private readonly List<string> specialAssetReports = new List<string>();
     private int scannedAssetCount;
@@ -50,11 +44,14 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     private string[] referenceScanPaths = new string[0];
     private int referenceScanIndex;
     private int referenceFinalizeIndex;
+    private int referencePrepareIndex;
     private bool referenceScanPrepared;
+    private bool findReferenceReadyChecked;
+    private bool findReferenceRefreshStarted;
+    private readonly HashSet<string> targetedReferencePaths =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ConversionCandidate> scanCandidatesByGuid =
         new Dictionary<string, ConversionCandidate>(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, AtlasInfo> scanAtlasesByGuid =
-        new Dictionary<string, AtlasInfo>(StringComparer.OrdinalIgnoreCase);
     private string scanFolderLabel = string.Empty;
     private ConversionRun conversionRun;
     private string progressMessage = string.Empty;
@@ -88,7 +85,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     {
         EditorGUILayout.LabelField("Sprite .asset 批量转 PNG", EditorStyles.boldLabel);
         EditorGUILayout.HelpBox(
-            "将 Sprite .asset 变成设计师可直接编辑的单图 PNG：完整同名源图直接复用，图集切片按 Sprite Rect 导出。最终 PNG 保持自己的 GUID，Assets 下的 Unity 序列化引用会迁移到 PNG；转换前自动备份，逐项失败逐项回滚。",
+            "将 Sprite .asset 变成设计师可直接编辑的单图 PNG：完整同名源图直接复用，图集切片按 Sprite Rect 导出。预检使用 FindReference2 定位直接引用文件并定向检查；源图集始终保留。转换前自动备份，逐项失败逐项回滚。",
             MessageType.Info);
         EditorGUI.BeginDisabledGroup(isBusy);
         DrawFolderSelection();
@@ -148,13 +145,16 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         var itemWarningCount = problemItems.Count + candidates.Sum(candidate => candidate.Warnings.Count);
         var itemNoteCount = candidates.Sum(candidate => candidate.Notes.Count);
         EditorGUILayout.LabelField(
-            string.Format("扫描 .asset：{0}    可转换：{1}    复用单图：{2}    图集导出：{3}    覆盖 PNG：{4}    图集组：{5}    问题：{6}    条目警告：{7}    条目说明：{8}",
+            string.Format("扫描 .asset：{0}    可转换：{1}    复用单图：{2}    图集导出：{3}    覆盖 PNG：{4}    问题：{5}    条目警告：{6}    条目说明：{7}",
                 scannedAssetCount, candidates.Count(c => !c.Blocked),
                 candidates.Count(c => c.ReuseExistingPng && !c.Blocked),
                 candidates.Count(c => !c.ReuseExistingPng && !c.OverwriteExistingPng && !c.Blocked),
                 candidates.Count(c => c.OverwriteExistingPng && !c.Blocked),
-                atlases.Count, scanProblems.Count + specialAssetReports.Count, itemWarningCount, itemNoteCount),
+                scanProblems.Count + specialAssetReports.Count, itemWarningCount, itemNoteCount),
             EditorStyles.miniBoldLabel);
+        EditorGUILayout.HelpBox(
+            "快速预检依赖 FindReference2 缓存，只覆盖资源直接引用；代码或序列化字符串中的 .asset 路径不会自动迁移。",
+            MessageType.Warning);
         if (scanProblems.Count > 0)
         {
             EditorGUILayout.HelpBox(string.Join("\n", scanProblems.Take(10).ToArray()), MessageType.Warning);
@@ -180,7 +180,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 Mathf.RoundToInt(sprite.rect.width), Mathf.RoundToInt(sprite.rect.height),
                 candidate.ApproximatePivot ? "，Pivot 将归一化" : string.Empty);
             EditorGUILayout.LabelField(Path.GetFileName(candidate.AssetPath), size, EditorStyles.miniLabel);
-            EditorGUILayout.LabelField(candidate.ActionLabel + "    引用：" + candidate.SerializedReferenceCount,
+            EditorGUILayout.LabelField(candidate.ActionLabel + "    序列化引用：" + candidate.SerializedReferenceCount +
+                                       " 处    FR2：" + candidate.Fr2DirectReferencerCount + " 个文件",
                 EditorStyles.miniBoldLabel);
             EditorGUILayout.LabelField(candidate.AssetPath + " -> " + candidate.OutputPath, EditorStyles.miniLabel);
         }
@@ -340,6 +341,21 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 AddCandidateWarning(candidate, "同名 PNG 缺少有效 meta/GUID，无法在保留其身份的前提下迁移引用。");
                 return;
             }
+            var existingImporter = AssetImporter.GetAtPath(desired) as TextureImporter;
+            if (existingImporter == null)
+            {
+                candidate.Blocked = true;
+                candidate.ActionLabel = "阻断：同名 PNG 导入器不可用";
+                AddCandidateWarning(candidate, "同名 PNG 没有可用的 TextureImporter，无法安全对齐 Sprite 参数。");
+                return;
+            }
+            if (existingImporter.spriteImportMode == SpriteImportMode.Multiple)
+            {
+                candidate.Blocked = true;
+                candidate.ActionLabel = "阻断：同名 PNG 是多 Sprite";
+                AddCandidateWarning(candidate, "同名 PNG 使用 Multiple Sprite；强制改为 Single 会使现有子 Sprite fileID 失效。");
+                return;
+            }
         }
 
         var sourceIsDesired = string.Equals(candidate.SourceTexturePath, desired, StringComparison.OrdinalIgnoreCase);
@@ -388,50 +404,16 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 candidate.AllGuidReferenceCount, candidate.MigratableReferenceCount));
         }
 
-        if (candidate.RuntimeStringReferencePaths.Count > 0)
+        var missingFromTargetedScan = candidate.Fr2DirectReferencePaths
+            .Where(path => !candidate.AllGuidReferencePaths.Contains(path))
+            .Take(4)
+            .ToArray();
+        if (missingFromTargetedScan.Length > 0)
         {
+            candidate.Blocked = true;
             AddCandidateWarning(candidate,
-                "发现疑似运行时字符串引用（只报告、不自动修改）：" +
-                string.Join("、", candidate.RuntimeStringReferencePaths.Take(4).ToArray()));
-        }
-
-        string[] fr2Referencers;
-        string fr2Error;
-        if (!TryGetFindReference2DirectReferencers(candidate.Guid, out fr2Referencers, out fr2Error))
-        {
-            AddCandidateNote(candidate, "FindReference2 交叉检查未运行（不阻断）：" + fr2Error);
-        }
-        else
-        {
-            var validReferencers = fr2Referencers
-                .Where(path => !string.Equals(path, candidate.AssetPath, StringComparison.OrdinalIgnoreCase))
-                .Where(path => !path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase))
-                .Where(path => !path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) ||
-                               File.Exists(AssetPathToAbsolute(path)))
-                .ToArray();
-            var nonTextReferencers = validReferencers
-                .Where(path => !IsUnitySerializedTextAsset(path))
-                .Take(4)
-                .ToArray();
-            if (nonTextReferencers.Length > 0)
-            {
-                candidate.Blocked = true;
-                AddCandidateWarning(candidate,
-                    "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
-            }
-            var missingFromYamlScan = validReferencers
-                .Where(path => IsUnitySerializedTextAsset(path) &&
-                               !candidate.AllGuidReferencePaths.Contains(path))
-                .Take(4)
-                .ToArray();
-            if (missingFromYamlScan.Length > 0)
-            {
-                candidate.Blocked = true;
-                AddCandidateWarning(candidate,
-                    "FindReference2 与 YAML 扫描结果不一致，请刷新缓存后重试：" +
-                    string.Join("、", missingFromYamlScan));
-            }
-            AddCandidateNote(candidate, "FindReference2 检出 " + validReferencers.Length + " 个直接引用；它仅用于交叉检查。");
+                "FindReference2 与定向 YAML 扫描结果不一致，请刷新缓存后重试：" +
+                string.Join("、", missingFromTargetedScan));
         }
         if (candidate.Blocked && !candidate.ActionLabel.StartsWith("阻断：", StringComparison.Ordinal))
         {
@@ -671,9 +653,12 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         referenceScanPaths = new string[0];
         referenceScanIndex = 0;
         referenceFinalizeIndex = 0;
+        referencePrepareIndex = 0;
         referenceScanPrepared = false;
+        findReferenceReadyChecked = false;
+        findReferenceRefreshStarted = false;
+        targetedReferencePaths.Clear();
         scanCandidatesByGuid.Clear();
-        scanAtlasesByGuid.Clear();
         scannedAssetCount = paths.Length;
         hasScanned = false;
         isBusy = true;
@@ -712,28 +697,92 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
             if (!referenceScanPrepared)
             {
-                foreach (var candidate in candidates)
+                if (!findReferenceReadyChecked)
                 {
-                    if (!string.IsNullOrEmpty(candidate.Guid)) scanCandidatesByGuid[candidate.Guid] = candidate;
-                }
-                BuildAtlasGroups();
-                foreach (var atlas in atlases)
-                {
-                    if (!string.IsNullOrEmpty(atlas.SourceTextureGuid))
+                    if (!candidates.Any(item => !item.Blocked))
                     {
-                        scanAtlasesByGuid[atlas.SourceTextureGuid] = atlas;
+                        findReferenceReadyChecked = true;
+                        referencePrepareIndex = candidates.Count;
+                    }
+                    else
+                    {
+                        string findReferenceError;
+                        if (!findReferenceRefreshStarted)
+                        {
+                            if (!TryStartFindReference2Refresh(out findReferenceError))
+                            {
+                                BlockAllConvertibleCandidatesForFindReferenceError(findReferenceError);
+                                findReferenceReadyChecked = true;
+                                referencePrepareIndex = candidates.Count;
+                            }
+                            else
+                            {
+                                findReferenceRefreshStarted = true;
+                                progressMessage = "预检：正在刷新 FindReference2 增量缓存";
+                                progressValue = 0.35f;
+                                EditorUtility.DisplayProgressBar("Sprite 预检", progressMessage, progressValue);
+                                Repaint();
+                                return;
+                            }
+                        }
+                        else if (!TryEnsureFindReference2Ready(out findReferenceError))
+                        {
+                            if (!findReferenceError.StartsWith(
+                                    "FindReference2 缓存尚未就绪", StringComparison.Ordinal))
+                            {
+                                BlockAllConvertibleCandidatesForFindReferenceError(findReferenceError);
+                                findReferenceReadyChecked = true;
+                                referencePrepareIndex = candidates.Count;
+                            }
+                            else
+                            {
+                                progressMessage = "预检：等待 FindReference2 增量缓存完成";
+                                progressValue = 0.35f;
+                                if (EditorUtility.DisplayCancelableProgressBar(
+                                        "Sprite 预检", progressMessage, progressValue))
+                                {
+                                    CancelScan();
+                                }
+                                Repaint();
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            findReferenceReadyChecked = true;
+                        }
                     }
                 }
-                referenceScanPaths = candidates.Count == 0
-                    ? new string[0]
-                    : Directory.GetFiles(Application.dataPath, "*", SearchOption.AllDirectories)
-                        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                        .ToArray();
+
+                if (referencePrepareIndex < candidates.Count)
+                {
+                    var candidate = candidates[referencePrepareIndex++];
+                    if (!candidate.Blocked)
+                    {
+                        PrepareCandidateReferenceScan(candidate);
+                    }
+                    var prepareProgress = candidates.Count == 0
+                        ? 0.5f
+                        : 0.35f + 0.15f * referencePrepareIndex / candidates.Count;
+                    progressMessage = "预检：FindReference2 查询 " + candidate.AssetPath;
+                    progressValue = prepareProgress;
+                    if (EditorUtility.DisplayCancelableProgressBar("Sprite 预检", progressMessage, prepareProgress))
+                    {
+                        CancelScan();
+                    }
+                    Repaint();
+                    return;
+                }
+
+                referenceScanPaths = targetedReferencePaths
+                    .Select(AssetPathToAbsolute)
+                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
                 referenceScanIndex = 0;
                 referenceFinalizeIndex = 0;
                 referenceScanPrepared = true;
-                progressMessage = "预检：准备扫描 Assets 引用";
-                progressValue = 0.35f;
+                progressMessage = "预检：准备检查 " + referenceScanPaths.Length + " 个 FR2 直接引用文件";
+                progressValue = 0.5f;
                 EditorUtility.DisplayProgressBar("Sprite 预检", progressMessage, progressValue);
                 Repaint();
                 return;
@@ -753,9 +802,9 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
                 var progress = referenceScanPaths.Length == 0
                     ? 0.9f
-                    : 0.35f + 0.55f * referenceScanIndex / referenceScanPaths.Length;
+                    : 0.5f + 0.4f * referenceScanIndex / referenceScanPaths.Length;
                 var currentAssetPath = string.IsNullOrEmpty(currentPath) ? "Assets" : AbsoluteToAssetPath(currentPath);
-                progressMessage = "预检：正在建立引用索引 " + currentAssetPath;
+                progressMessage = "预检：正在检查 FR2 直接引用 " + currentAssetPath;
                 progressValue = progress;
                 if (EditorUtility.DisplayCancelableProgressBar("Sprite 预检", progressMessage, progress))
                 {
@@ -783,7 +832,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 return;
             }
 
-            BuildAtlasGroups();
             progressMessage = "预检完成";
             progressValue = 1f;
             hasScanned = true;
@@ -811,11 +859,108 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             candidate.Blocked = true;
             AddCandidateWarning(candidate, "预检被取消，该条目不会转换。");
         }
-        BuildAtlasGroups();
         hasScanned = true;
         isBusy = false;
         EditorApplication.update -= ScanStep;
         EditorUtility.ClearProgressBar();
+    }
+
+    private void PrepareCandidateReferenceScan(ConversionCandidate candidate)
+    {
+        if (candidate == null || string.IsNullOrEmpty(candidate.Guid)) return;
+        scanCandidatesByGuid[candidate.Guid] = candidate;
+
+        string[] referencers;
+        string error;
+        if (!TryGetFindReference2DirectReferencers(candidate.Guid, out referencers, out error))
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate, "FindReference2 查询失败，预检已阻断：" + error);
+            return;
+        }
+
+        var directPaths = NormalizeFindReferencePaths(candidate.AssetPath, referencers);
+        candidate.Fr2DirectReferencerCount = directPaths.Length;
+        foreach (var path in directPaths)
+        {
+            candidate.Fr2DirectReferencePaths.Add(path);
+            if (IsUnitySerializedTextAsset(path))
+            {
+                targetedReferencePaths.Add(path);
+            }
+        }
+
+        var unsupportedPaths = directPaths
+            .Where(path => !IsUnitySerializedTextAsset(path))
+            .Take(4)
+            .ToArray();
+        if (unsupportedPaths.Length > 0)
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate,
+                "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", unsupportedPaths));
+        }
+        AddCandidateNote(candidate, "FindReference2 检出 " + directPaths.Length + " 个直接引用文件。");
+
+        if (string.IsNullOrEmpty(candidate.ExistingPngGuid)) return;
+
+        string[] targetReferencers;
+        string targetError;
+        if (!TryGetFindReference2DirectReferencers(candidate.ExistingPngGuid, out targetReferencers, out targetError))
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate, "无法确认同名 PNG 的现有引用，预检已阻断：" + targetError);
+            return;
+        }
+
+        var targetDirectPaths = NormalizeFindReferencePaths(candidate.AssetPath, targetReferencers);
+        candidate.ExistingPngDirectReferencePaths.UnionWith(targetDirectPaths);
+        if (candidate.OverwriteExistingPng && targetDirectPaths.Length > 0)
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate,
+                "同名 PNG 已被其他资源直接引用，覆盖像素和导入参数可能改变现有内容：" +
+                string.Join("、", targetDirectPaths.Take(4).ToArray()));
+        }
+        else if (candidate.ReuseExistingPng && candidate.SettingDifferences.Count > 0 &&
+                 targetDirectPaths.Length > 0)
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate,
+                "同名 PNG 已被其他资源直接引用，且导入参数需要变化：" +
+                string.Join("、", targetDirectPaths.Take(4).ToArray()));
+        }
+    }
+
+    private void BlockAllConvertibleCandidatesForFindReferenceError(string error)
+    {
+        scanProblems.Add("FindReference2 不可用，快速预检已阻断：" + error);
+        foreach (var candidate in candidates.Where(item => !item.Blocked))
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate, "FindReference2 不可用，无法确认直接引用文件。");
+        }
+    }
+
+    private static string[] NormalizeFindReferencePaths(string selfPath, IEnumerable<string> paths)
+    {
+        return (paths ?? Enumerable.Empty<string>())
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => path.Replace('\\', '/'))
+            .Where(path => !string.Equals(path, selfPath, StringComparison.OrdinalIgnoreCase))
+            .Where(path => !path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private void BlockCandidatesForReferencePath(string assetPath, string message)
+    {
+        foreach (var candidate in candidates.Where(item => item.Fr2DirectReferencePaths.Contains(assetPath)))
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate, message);
+        }
     }
 
     private void ProcessProjectReferencePath(string absolutePath)
@@ -832,69 +977,46 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         }
 
         var isYaml = IsUnitySerializedTextFile(absolutePath);
-        if (!isYaml && !TextExtensions.Contains(Path.GetExtension(absolutePath))) return;
+        if (!isYaml)
+        {
+            BlockCandidatesForReferencePath(assetPath, "FR2 直接引用文件不是可迁移的 Unity YAML：" + assetPath);
+            return;
+        }
 
         string content;
         try
         {
             content = File.ReadAllText(absolutePath);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            AddScanProblemItem(assetPath, "读取 FR2 直接引用文件失败：" + exception.Message);
+            BlockCandidatesForReferencePath(assetPath, "无法读取直接引用文件，预检已阻断：" + assetPath);
             return;
         }
 
-        if (isYaml)
+        foreach (Match match in SerializedGuidRegex.Matches(content))
         {
-            foreach (Match match in SerializedGuidRegex.Matches(content))
+            var guid = match.Groups[1].Value;
+            ConversionCandidate candidate;
+            if (scanCandidatesByGuid.TryGetValue(guid, out candidate))
             {
-                var guid = match.Groups[1].Value;
-                ConversionCandidate candidate;
-                if (scanCandidatesByGuid.TryGetValue(guid, out candidate))
-                {
-                    candidate.AllGuidReferenceCount++;
-                    candidate.AllGuidReferencePaths.Add(assetPath);
-                }
-                AtlasInfo atlas;
-                if (scanAtlasesByGuid.TryGetValue(guid, out atlas))
-                {
-                    atlas.GuidReferencePaths.Add(assetPath);
-                }
+                candidate.AllGuidReferenceCount++;
+                candidate.AllGuidReferencePaths.Add(assetPath);
             }
-
-            foreach (Match match in SerializedSpriteReferenceRegex.Matches(content))
-            {
-                ConversionCandidate candidate;
-                long localId;
-                if (!scanCandidatesByGuid.TryGetValue(match.Groups[2].Value, out candidate) ||
-                    !long.TryParse(match.Groups[1].Value, out localId) || localId != candidate.LocalId)
-                {
-                    continue;
-                }
-                candidate.MigratableReferenceCount++;
-                candidate.SerializedReferencePaths.Add(assetPath);
-            }
-            return;
         }
 
-        foreach (var candidate in candidates)
+        foreach (Match match in SerializedSpriteReferenceRegex.Matches(content))
         {
-            if ((!string.IsNullOrEmpty(candidate.Guid) &&
-                 content.IndexOf(candidate.Guid, StringComparison.OrdinalIgnoreCase) >= 0) ||
-                content.IndexOf(candidate.AssetPath, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                content.IndexOf(candidate.AssetPath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
+            ConversionCandidate candidate;
+            long localId;
+            if (!scanCandidatesByGuid.TryGetValue(match.Groups[2].Value, out candidate) ||
+                !long.TryParse(match.Groups[1].Value, out localId) || localId != candidate.LocalId)
             {
-                candidate.RuntimeStringReferencePaths.Add(assetPath);
+                continue;
             }
-        }
-        foreach (var atlas in scanAtlasesByGuid.Values)
-        {
-            if (content.IndexOf(atlas.SourceTextureGuid, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                content.IndexOf(atlas.SourceTexturePath, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                content.IndexOf(atlas.SourceTexturePath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                atlas.RuntimeStringReferencePaths.Add(assetPath);
-            }
+            candidate.MigratableReferenceCount++;
+            candidate.SerializedReferencePaths.Add(assetPath);
         }
     }
 
@@ -948,7 +1070,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             Guid = guid,
             LocalId = localId,
             SourceTexturePath = sourceTexturePath,
-            SourceTextureGuid = AssetDatabase.AssetPathToGUID(sourceTexturePath),
             OutputPath = outputPath,
             NormalizedPivot = normalizedPivot,
             ApproximatePivot = RequiresPivotNormalization(normalizedPivot),
@@ -966,7 +1087,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         if (convertibleCount == 0) return;
         if (!EditorUtility.DisplayDialog(
                 "确认批量转换",
-                string.Format("将处理 {0} 个 Sprite .asset（另有 {1} 个条目因预检冲突而保留）。工具会逐帧执行，每项完成后更新进度；原文件备份到 Library/SpriteAssetToPngBackups。转换完成后，未被引用的图集会单独二次确认删除。是否继续？", convertibleCount, candidates.Count - convertibleCount),
+                string.Format("将处理 {0} 个 Sprite .asset（另有 {1} 个条目因预检冲突而保留）。工具会逐帧执行，每项完成后更新进度；原文件备份到 Library/SpriteAssetToPngBackups，源图集始终保留。是否继续？", convertibleCount, candidates.Count - convertibleCount),
                 "转换", "取消"))
         {
             return;
@@ -978,9 +1099,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             BackupRoot = Path.Combine(ProjectRoot, "Library", "SpriteAssetToPngBackups", batchName),
             Pending = candidates.Where(candidate => !candidate.Blocked).ToArray(),
             Successes = new List<string>(),
-            Failures = new List<string>(),
-            DeletedAtlases = new List<string>(),
-            KeptAtlases = new List<string>()
+            Failures = new List<string>()
         };
         isBusy = true;
         EditorApplication.update -= ConversionStep;
@@ -1002,6 +1121,43 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
         try
         {
+            if (!run.FindReferenceRefreshStarted)
+            {
+                string refreshError;
+                if (!TryStartFindReference2Refresh(out refreshError))
+                {
+                    run.Failures.Add("转换前刷新 FindReference2 失败：" + refreshError);
+                    FinishConversion(run);
+                    return;
+                }
+                run.FindReferenceRefreshStarted = true;
+                progressMessage = "转换：正在刷新 FindReference2 增量缓存";
+                progressValue = 0f;
+                EditorUtility.DisplayProgressBar("Sprite 转 PNG", progressMessage, progressValue);
+                Repaint();
+                return;
+            }
+
+            string findReferenceError;
+            if (!TryEnsureFindReference2Ready(out findReferenceError))
+            {
+                if (!findReferenceError.StartsWith("FindReference2 缓存尚未就绪", StringComparison.Ordinal))
+                {
+                    run.Failures.Add("转换前检查 FindReference2 失败：" + findReferenceError);
+                    FinishConversion(run);
+                    return;
+                }
+                progressMessage = "转换：等待 FindReference2 增量缓存完成";
+                progressValue = run.Pending.Length == 0 ? 0f : (float)run.Index / run.Pending.Length;
+                if (EditorUtility.DisplayCancelableProgressBar("Sprite 转 PNG", progressMessage, progressValue))
+                {
+                    run.Failures.Add("用户取消，剩余项目未处理。");
+                    FinishConversion(run);
+                }
+                Repaint();
+                return;
+            }
+
             if (run.Index < run.Pending.Length)
             {
                 var candidate = run.Pending[run.Index];
@@ -1034,24 +1190,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 return;
             }
 
-            if (!run.Refreshed)
-            {
-                progressMessage = "转换：刷新 Unity 资源数据库";
-                progressValue = 0.92f;
-                EditorUtility.DisplayProgressBar("Sprite 转 PNG", "刷新 Unity 资源数据库", 0.92f);
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
-                run.Refreshed = true;
-                return;
-            }
-            if (!run.AtlasChecked)
-            {
-                progressMessage = "转换：检查图集引用并等待删除确认";
-                progressValue = 0.98f;
-                EditorUtility.DisplayProgressBar("Sprite 转 PNG", "检查图集引用并准备删除确认", 0.98f);
-                DeleteUnusedAtlases(run.BackupRoot, run.Successes, run.Pending, run.DeletedAtlases, run.KeptAtlases);
-                run.AtlasChecked = true;
-                FinishConversion(run);
-            }
+            FinishConversion(run);
         }
         catch (Exception exception)
         {
@@ -1073,8 +1212,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         summary.AppendLine("转换成功：" + run.Successes.Count);
         summary.AppendLine("复用现有 PNG 并删除旧 .asset：" + run.ReusedPng);
         summary.AppendLine("失败/未处理：" + run.Failures.Count);
-        summary.AppendLine("删除未引用图集：" + run.DeletedAtlases.Count);
-        summary.AppendLine("保留图集：" + run.KeptAtlases.Count);
+        summary.AppendLine("源图集：全部保留");
         summary.AppendLine("备份：" + run.BackupRoot);
         if (run.Failures.Count > 0)
         {
@@ -1151,20 +1289,42 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
             string[] fr2Referencers;
             string fr2Error;
-            if (TryGetFindReference2DirectReferencers(oldGuid, out fr2Referencers, out fr2Error))
+            if (!TryGetFindReference2DirectReferencers(oldGuid, out fr2Referencers, out fr2Error))
             {
-                var nonTextReferencers = fr2Referencers
-                    .Where(path => !string.Equals(path, candidate.AssetPath, StringComparison.OrdinalIgnoreCase))
-                    .Where(path => !path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase))
-                    .Where(path => !path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) ||
-                                   File.Exists(AssetPathToAbsolute(path)))
-                    .Where(path => !IsUnitySerializedTextAsset(path))
-                    .Take(4)
-                    .ToArray();
-                if (nonTextReferencers.Length > 0)
+                throw new InvalidOperationException("转换前无法重新查询 FindReference2：" + fr2Error);
+            }
+            var currentReferencers = NormalizeFindReferencePaths(assetPath, fr2Referencers);
+            var nonTextReferencers = currentReferencers
+                .Where(path => !IsUnitySerializedTextAsset(path))
+                .Take(4)
+                .ToArray();
+            if (nonTextReferencers.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
+            }
+            if (!candidate.Fr2DirectReferencePaths.SetEquals(currentReferencers))
+            {
+                throw new InvalidOperationException("FindReference2 引用文件在预检后发生变化，请重新预检。");
+            }
+
+            if (!string.IsNullOrEmpty(candidate.ExistingPngGuid))
+            {
+                string[] targetReferencers;
+                string targetError;
+                if (!TryGetFindReference2DirectReferencers(
+                        candidate.ExistingPngGuid, out targetReferencers, out targetError))
                 {
-                    throw new InvalidOperationException(
-                        "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
+                    throw new InvalidOperationException("转换前无法重新查询同名 PNG 引用：" + targetError);
+                }
+                var currentTargetReferencers = NormalizeFindReferencePaths(assetPath, targetReferencers);
+                if (!candidate.ExistingPngDirectReferencePaths.SetEquals(currentTargetReferencers))
+                {
+                    throw new InvalidOperationException("同名 PNG 的引用在预检后发生变化，请重新预检。");
+                }
+                if (candidate.OverwriteExistingPng && currentTargetReferencers.Length > 0)
+                {
+                    throw new InvalidOperationException("同名 PNG 已被其他资源直接引用，不能安全覆盖。");
                 }
             }
 
@@ -1343,6 +1503,55 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         return true;
     }
 
+    private static bool TryStartFindReference2Refresh(out string error)
+    {
+        if (!TryEnsureFindReference2Ready(out error)) return false;
+
+        Type cacheType = null;
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            cacheType = assembly.GetType("vietlabs.fr2.FR2_Cache", false);
+            if (cacheType != null) break;
+        }
+        if (cacheType == null)
+        {
+            error = "未找到 FindReference2 缓存类型。";
+            return false;
+        }
+
+        try
+        {
+            var apiProperty = cacheType.GetProperty(
+                "Api", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            var api = apiProperty == null ? null : apiProperty.GetValue(null, null);
+            var checkChanges = api == null
+                ? null
+                : api.GetType().GetMethod("Check4Changes",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                    null, new[] { typeof(bool) }, null);
+            if (api == null || checkChanges == null)
+            {
+                error = "FindReference2 缺少增量缓存刷新接口。";
+                return false;
+            }
+
+            checkChanges.Invoke(api, new object[] { false });
+            error = string.Empty;
+            return true;
+        }
+        catch (TargetInvocationException exception)
+        {
+            error = "刷新 FindReference2 缓存失败：" +
+                    (exception.InnerException == null ? exception.Message : exception.InnerException.Message);
+            return false;
+        }
+        catch (Exception exception)
+        {
+            error = "刷新 FindReference2 缓存失败：" + exception.Message;
+            return false;
+        }
+    }
+
     private static bool TryEnsureFindReference2Ready(out string error)
     {
         error = string.Empty;
@@ -1430,19 +1639,43 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             }
 
             var directPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var malformedEntryCount = 0;
             foreach (DictionaryEntry entry in result)
             {
                 var value = entry.Value;
-                if (value == null) continue;
+                if (value == null)
+                {
+                    malformedEntryCount++;
+                    continue;
+                }
                 var valueType = value.GetType();
                 var depthField = valueType.GetField("depth", BindingFlags.Public | BindingFlags.Instance);
-                if (depthField == null || (int)depthField.GetValue(value) != 1) continue;
+                if (depthField == null)
+                {
+                    malformedEntryCount++;
+                    continue;
+                }
+                if ((int)depthField.GetValue(value) != 1) continue;
                 var assetField = valueType.GetField("asset", BindingFlags.Public | BindingFlags.Instance);
                 var asset = assetField == null ? null : assetField.GetValue(value);
-                if (asset == null) continue;
+                if (asset == null)
+                {
+                    malformedEntryCount++;
+                    continue;
+                }
                 var pathProperty = asset.GetType().GetProperty("assetPath", BindingFlags.Public | BindingFlags.Instance);
                 var path = pathProperty == null ? null : pathProperty.GetValue(asset, null) as string;
-                if (!string.IsNullOrEmpty(path)) directPaths.Add(path.Replace('\\', '/'));
+                if (string.IsNullOrEmpty(path))
+                {
+                    malformedEntryCount++;
+                    continue;
+                }
+                directPaths.Add(path.Replace('\\', '/'));
+            }
+            if (malformedEntryCount > 0)
+            {
+                error = "FindReference2 返回了 " + malformedEntryCount + " 个无法解析的引用条目。";
+                return false;
             }
             paths = directPaths.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
             error = string.Empty;
@@ -1621,158 +1854,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         return result;
     }
 
-    private void BuildAtlasGroups()
-    {
-        var existing = atlases.ToDictionary(
-            atlas => atlas.SourceTexturePath,
-            atlas => atlas,
-            StringComparer.OrdinalIgnoreCase);
-        var rebuilt = new List<AtlasInfo>();
-        foreach (var group in candidates.Where(candidate => !candidate.ReuseExistingPng && !candidate.Blocked)
-                     .GroupBy(c => c.SourceTexturePath, StringComparer.OrdinalIgnoreCase))
-        {
-            AtlasInfo atlas;
-            if (!existing.TryGetValue(group.Key, out atlas))
-            {
-                atlas = new AtlasInfo();
-            }
-            atlas.SourceTexturePath = group.Key;
-            atlas.SourceTextureGuid = group.First().SourceTextureGuid;
-            atlas.CandidateCount = group.Count();
-            rebuilt.Add(atlas);
-        }
-        atlases.Clear();
-        atlases.AddRange(rebuilt);
-        atlases.Sort((a, b) => string.Compare(a.SourceTexturePath, b.SourceTexturePath, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private void DeleteUnusedAtlases(
-        string backupRoot,
-        List<string> successes,
-        IEnumerable<ConversionCandidate> pending,
-        List<string> deleted,
-        List<string> kept)
-    {
-        if (successes.Count == 0) return;
-        var successPaths = new HashSet<string>(
-            successes.Select(s => s.Split(new[] { " -> " }, StringSplitOptions.None)[0]),
-            StringComparer.OrdinalIgnoreCase);
-        var sourcePaths = pending.Where(c => successPaths.Contains(c.AssetPath) && !c.ReuseExistingPng)
-            .Select(c => c.SourceTexturePath)
-            .Where(p => !string.IsNullOrEmpty(p))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var safe = new List<AtlasUsage>();
-        foreach (var sourcePath in sourcePaths)
-        {
-            var atlas = atlases.FirstOrDefault(item =>
-                string.Equals(item.SourceTexturePath, sourcePath, StringComparison.OrdinalIgnoreCase));
-            var usage = AnalyzeAtlasUsage(sourcePath, atlas);
-            if (usage.CanDelete) safe.Add(usage);
-            else kept.Add(sourcePath + "（" + string.Join("；", usage.Blockers.Take(4).ToArray()) + "）");
-        }
-        if (safe.Count == 0) return;
-
-        var message = "以下图集当前未发现有效引用，删除前会备份：\n\n" +
-                      string.Join("\n", safe.Select(a => a.Path +
-                          (a.Notes.Count == 0 ? string.Empty : "（" + string.Join("；", a.Notes.ToArray()) + "）")).ToArray()) +
-                      "\n\n是否删除？";
-        if (!EditorUtility.DisplayDialog("二次确认：删除未引用图集", message, "删除图集", "保留"))
-        {
-            kept.AddRange(safe.Select(a => a.Path + "（用户选择保留）"));
-            return;
-        }
-
-        AssetDatabase.DisallowAutoRefresh();
-        try
-        {
-            foreach (var atlas in safe)
-            {
-                var absolute = AssetPathToAbsolute(atlas.Path);
-                var backup = Path.Combine(backupRoot, "Atlases", atlas.Path.Replace('/', Path.DirectorySeparatorChar));
-                Directory.CreateDirectory(Path.GetDirectoryName(backup) ?? backupRoot);
-                if (File.Exists(absolute)) File.Copy(absolute, backup, true);
-                if (File.Exists(absolute + ".meta")) File.Copy(absolute + ".meta", backup + ".meta", true);
-                DeleteFileIfExists(absolute);
-                DeleteFileIfExists(absolute + ".meta");
-                deleted.Add(atlas.Path);
-            }
-        }
-        finally
-        {
-            AssetDatabase.AllowAutoRefresh();
-        }
-    }
-
-    private static AtlasUsage AnalyzeAtlasUsage(string sourcePath, AtlasInfo atlas)
-    {
-        var usage = new AtlasUsage { Path = sourcePath, Guid = AssetDatabase.AssetPathToGUID(sourcePath) };
-        if (string.IsNullOrEmpty(usage.Guid))
-        {
-            usage.Blockers.Add("无法读取图集 GUID");
-            return usage;
-        }
-        string fr2Error;
-
-        if (atlas == null)
-        {
-            usage.Blockers.Add("缺少预检阶段的图集引用快照");
-            return usage;
-        }
-
-        foreach (var path in atlas.GuidReferencePaths)
-        {
-            if (string.Equals(path, sourcePath, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(path, sourcePath + ".meta", StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
-            var absolutePath = AssetPathToAbsolute(path);
-            if (!IsUnitySerializedTextFile(absolutePath)) continue;
-            string content;
-            try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
-            if (ContainsGuidReference(content, usage.Guid)) usage.Blockers.Add(path + "（GUID 引用）");
-        }
-
-        foreach (var path in atlas.RuntimeStringReferencePaths)
-        {
-            var absolutePath = AssetPathToAbsolute(path);
-            if (!File.Exists(absolutePath)) continue;
-            string content;
-            try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
-            if (content.IndexOf(usage.Guid, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                content.IndexOf(sourcePath, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                content.IndexOf(sourcePath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                usage.Blockers.Add(path + "（字符串路径引用）");
-            }
-        }
-
-        string[] fr2Referencers;
-        if (TryGetFindReference2DirectReferencers(usage.Guid, out fr2Referencers, out fr2Error))
-        {
-            foreach (var pluginPath in fr2Referencers)
-            {
-                if (string.Equals(pluginPath, sourcePath, StringComparison.OrdinalIgnoreCase) ||
-                    pluginPath.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
-                if (pluginPath.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) &&
-                    !File.Exists(AssetPathToAbsolute(pluginPath))) continue;
-                usage.Blockers.Add(pluginPath + "（FindReference2）");
-            }
-        }
-        else
-        {
-            usage.Notes.Add("FindReference2 未交叉检查：" + fr2Error);
-        }
-        usage.Blockers = usage.Blockers.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        usage.CanDelete = usage.Blockers.Count == 0;
-        return usage;
-    }
-
-    private static bool ContainsGuidReference(string content, string guid)
-    {
-        return SerializedGuidRegex.Matches(content).Cast<Match>()
-            .Any(match => string.Equals(match.Groups[1].Value, guid, StringComparison.OrdinalIgnoreCase));
-    }
-
     private static string GetOutputPath(string assetPath)
     {
         var desired = Path.ChangeExtension(assetPath, ".png").Replace('\\', '/');
@@ -1843,7 +1924,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         ClearPreviewCache();
         candidates.Clear();
         problemItems.Clear();
-        atlases.Clear();
         scanProblems.Clear();
         specialAssetReports.Clear();
         scannedAssetCount = 0;
@@ -1853,9 +1933,12 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         referenceScanPaths = new string[0];
         referenceScanIndex = 0;
         referenceFinalizeIndex = 0;
+        referencePrepareIndex = 0;
         referenceScanPrepared = false;
+        findReferenceReadyChecked = false;
+        findReferenceRefreshStarted = false;
+        targetedReferencePaths.Clear();
         scanCandidatesByGuid.Clear();
-        scanAtlasesByGuid.Clear();
         hasScanned = false;
     }
 
@@ -1968,7 +2051,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public string Guid;
         public long LocalId;
         public string SourceTexturePath;
-        public string SourceTextureGuid;
         public string OutputPath;
         public Vector2 NormalizedPivot;
         public bool ApproximatePivot;
@@ -1981,11 +2063,14 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public int SerializedReferenceCount;
         public int AllGuidReferenceCount;
         public int MigratableReferenceCount;
+        public int Fr2DirectReferencerCount;
         public readonly HashSet<string> AllGuidReferencePaths =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         public readonly HashSet<string> SerializedReferencePaths =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        public readonly HashSet<string> RuntimeStringReferencePaths =
+        public readonly HashSet<string> Fr2DirectReferencePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> ExistingPngDirectReferencePaths =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         public bool Blocked;
     }
@@ -1996,37 +2081,14 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public string Message;
     }
 
-    private sealed class AtlasInfo
-    {
-        public string SourceTexturePath;
-        public string SourceTextureGuid;
-        public int CandidateCount;
-        public readonly HashSet<string> GuidReferencePaths =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        public readonly HashSet<string> RuntimeStringReferencePaths =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    }
-
-    private sealed class AtlasUsage
-    {
-        public string Path;
-        public string Guid;
-        public bool CanDelete;
-        public List<string> Blockers = new List<string>();
-        public List<string> Notes = new List<string>();
-    }
-
     private sealed class ConversionRun
     {
         public string BackupRoot;
         public ConversionCandidate[] Pending;
         public List<string> Successes;
         public List<string> Failures;
-        public List<string> DeletedAtlases;
-        public List<string> KeptAtlases;
         public int Index;
-        public bool Refreshed;
-        public bool AtlasChecked;
+        public bool FindReferenceRefreshStarted;
         public int ReusedPng;
     }
 
