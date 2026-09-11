@@ -1,86 +1,219 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 /// <summary>
-/// Lists Image/RawImage references in a prefab and creates a copy with Sprite replacements.
+/// Previews Image and RawImage Sprite replacements on a scene object, then optionally saves them to a Prefab.
 /// </summary>
 public sealed class PrefabImageReplacerWindow : EditorWindow
 {
+    private const string SessionKey = "PrefabImageReplacerWindow.Session";
     private const string OutputSuffix = "_Replaced";
+    private const int AppliedStateVersion = 2;
+    private const int SessionVersion = 2;
+    private const int PageSize = 30;
     private const float PreviewSize = 44f;
+    private const float NativeSizeWarningThreshold = 0.5f;
 
-    private GameObject prefab;
-    private string searchText = string.Empty;
-    private Vector2 scrollPosition;
-    private Vector2 problemScrollPosition;
-    private List<ImageSlot> slots = new List<ImageSlot>();
-    private List<ScanProblem> scanProblems = new List<ScanProblem>();
-    private Hash128 scannedDependencyHash;
-    private SaveMode saveMode = SaveMode.CreateCopy;
-    private int lastReviewIssueCount;
-    private bool problemDetailsExpanded;
-    private bool hasScanned;
-    private bool isBusy;
-    private bool isApplyQueued;
+    [SerializeField] private GameObject targetObject;
+    [SerializeField] private string targetDisplayName = string.Empty;
+    [SerializeField] private string targetError = string.Empty;
+    [SerializeField] private string searchText = string.Empty;
+    [SerializeField] private Vector2 scrollPosition;
+    [SerializeField] private List<ImageSlot> slots = new List<ImageSlot>();
+    [SerializeField] private int currentPage;
+    [SerializeField] private bool hasSession;
+    [SerializeField] private bool isSaveQueued;
+    [SerializeField] private int serializedVersion;
+
+    [NonSerialized] private GUIStyle pathButtonStyle;
+    [NonSerialized] private bool isRestoreQueued;
+
+    private GUIStyle PathButtonStyle
+    {
+        get
+        {
+            if (pathButtonStyle == null)
+            {
+                pathButtonStyle = new GUIStyle(EditorStyles.miniButton)
+                {
+                    alignment = TextAnchor.MiddleLeft,
+                    wordWrap = true
+                };
+            }
+
+            return pathButtonStyle;
+        }
+    }
 
     [MenuItem("Tools/Prefab Image Replacer")]
     public static void Open()
     {
-        GetWindow<PrefabImageReplacerWindow>("Prefab Image Replacer");
+        var window = GetWindow<PrefabImageReplacerWindow>("Prefab Image Replacer");
+        window.minSize = new Vector2(640f, 420f);
     }
 
-    private void OnInspectorUpdate()
+    private void OnEnable()
     {
-        if (prefab == null || isBusy)
+        minSize = new Vector2(640f, 420f);
+        isSaveQueued = false;
+        isRestoreQueued = false;
+        Undo.undoRedoPerformed -= OnUndoRedoPerformed;
+        Undo.undoRedoPerformed += OnUndoRedoPerformed;
+        Selection.selectionChanged -= OnSelectionChanged;
+        Selection.selectionChanged += OnSelectionChanged;
+
+        if (slots == null)
         {
-            return;
+            slots = new List<ImageSlot>();
+        }
+        else
+        {
+            slots = slots.Where(slot => slot != null).ToList();
         }
 
-        var path = AssetDatabase.GetAssetPath(prefab);
-        if (string.IsNullOrEmpty(path) || !path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+        if (serializedVersion < AppliedStateVersion)
         {
-            return;
+            foreach (var slot in slots)
+            {
+                slot.IsReplacementApplied = slot.Replacement != null;
+                if (!slot.IsReplacementApplied)
+                {
+                    slot.UseNativeSize = false;
+                }
+            }
+        }
+        else
+        {
+            foreach (var slot in slots)
+            {
+                if (slot.Replacement == null || !slot.IsReplacementApplied)
+                {
+                    slot.UseNativeSize = false;
+                }
+            }
         }
 
-        var dependencyHash = AssetDatabase.GetAssetDependencyHash(path);
-        if (hasScanned && dependencyHash != scannedDependencyHash)
-        {
-            ScanPrefab();
-        }
+        serializedVersion = SessionVersion;
 
+        if (!hasSession)
+        {
+            RestoreSession();
+        }
+    }
+
+    private void OnDisable()
+    {
+        Undo.undoRedoPerformed -= OnUndoRedoPerformed;
+        Selection.selectionChanged -= OnSelectionChanged;
+        PersistSession();
+    }
+
+    private void OnUndoRedoPerformed()
+    {
+        PersistSession();
+        Repaint();
+    }
+
+    private void OnSelectionChanged()
+    {
         Repaint();
     }
 
     private void OnGUI()
     {
-        EditorGUILayout.LabelField("Prefab 图片引用替换", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("场景图片引用实时替换", EditorStyles.boldLabel);
         EditorGUILayout.HelpBox(
-            "按原始 Sprite/Texture 聚合列出 Image 和 RawImage 引用。配置替换 Sprite 后，可生成新 Prefab 或直接修改当前 Prefab。",
+            "拖入场景对象后，会按原始图片资源聚合 Image/RawImage 引用。组内换图会立即作用到全部引用；原尺寸和还原仍按物体独立控制。工具不会自动保存场景或 Prefab。",
             MessageType.Info);
-        EditorGUILayout.LabelField("提示：点击原图或槽位图缩略图可在 Project 窗口中定位资源。", EditorStyles.miniLabel);
 
-        EditorGUI.BeginChangeCheck();
-        var selectedPrefab = (GameObject)EditorGUILayout.ObjectField(
-            new GUIContent("Prefab", "要扫描的 Prefab 资源"), prefab, typeof(GameObject), false);
-        if (EditorGUI.EndChangeCheck())
+        var editingDisabled = EditorApplication.isPlayingOrWillChangePlaymode;
+        if (editingDisabled)
         {
-            prefab = selectedPrefab;
-            ScanPrefab();
+            EditorGUILayout.HelpBox("实时替换仅支持编辑模式。退出播放模式后再操作。", MessageType.Warning);
         }
 
+        using (new EditorGUI.DisabledScope(editingDisabled))
+        {
+            DrawTargetField();
+            DrawToolbar();
+        }
+
+        if (!string.IsNullOrEmpty(targetError))
+        {
+            EditorGUILayout.HelpBox(targetError, MessageType.Error);
+        }
+
+        if (!hasSession)
+        {
+            EditorGUILayout.HelpBox("请拖入当前已加载场景中的一个 GameObject。", MessageType.Warning);
+            return;
+        }
+
+        if (targetObject == null)
+        {
+            EditorGUILayout.HelpBox(
+                "原场景对象已删除或所在场景已卸载。失效槽位会保留并跳过；拖入新对象可开始新的扫描。",
+                MessageType.Warning);
+        }
+        else
+        {
+            EditorGUILayout.LabelField("扫描对象", targetDisplayName, EditorStyles.miniLabel);
+            EditorGUILayout.HelpBox(
+                "预览修改会进入 Undo 并使场景变为未保存状态。关闭窗口不会自动还原；若保存场景，当前预览结果也会保存。",
+                MessageType.Warning);
+        }
+
+        DrawSlotList(editingDisabled);
+        DrawSaveControls(editingDisabled);
+    }
+
+    private void DrawTargetField()
+    {
+        EditorGUI.BeginChangeCheck();
+        var selected = (GameObject)EditorGUILayout.ObjectField(
+            new GUIContent("场景对象", "扫描这个场景对象及其全部子节点"),
+            targetObject,
+            typeof(GameObject),
+            true);
+        if (!EditorGUI.EndChangeCheck())
+        {
+            return;
+        }
+
+        if (selected == null)
+        {
+            ClearSession();
+            return;
+        }
+
+        string error;
+        if (!IsValidSceneTarget(selected, out error))
+        {
+            targetError = error;
+            return;
+        }
+
+        targetError = string.Empty;
+        targetObject = selected;
+        targetDisplayName = selected.scene.name + ": " + BuildTransformPath(selected.transform, null);
+        hasSession = true;
+        RebuildBaseline(false);
+    }
+
+    private void DrawToolbar()
+    {
         using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
         {
             EditorGUILayout.LabelField(
-                new GUIContent("筛选", "按图片名、资源路径或节点路径筛选图片槽位"),
+                new GUIContent("筛选", "按节点路径、组件类型、图片名或资源路径筛选"),
                 EditorStyles.miniLabel,
                 GUILayout.Width(32f));
+
             var newSearch = EditorGUILayout.TextField(
                 searchText,
                 GUI.skin.FindStyle("ToolbarSeachTextField") ?? GUI.skin.textField,
@@ -88,196 +221,1162 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             if (!string.Equals(newSearch, searchText, StringComparison.Ordinal))
             {
                 searchText = newSearch;
-                Repaint();
+                currentPage = 0;
+                scrollPosition = Vector2.zero;
             }
 
-            if (GUILayout.Button("刷新", EditorStyles.toolbarButton, GUILayout.Width(52f)))
+            using (new EditorGUI.DisabledScope(targetObject == null))
             {
-                ScanPrefab();
-            }
-        }
-
-        if (prefab == null)
-        {
-            EditorGUILayout.HelpBox("请拖入一个 Prefab 资源。", MessageType.Warning);
-            return;
-        }
-
-        var prefabPath = AssetDatabase.GetAssetPath(prefab);
-        if (string.IsNullOrEmpty(prefabPath) || !prefabPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
-        {
-            EditorGUILayout.HelpBox("当前对象不是项目中的 Prefab 资源。", MessageType.Error);
-            return;
-        }
-
-        var selectedSaveMode = (SaveMode)EditorGUILayout.Popup(
-            "保存方式",
-            (int)saveMode,
-            new[] { "新增预制体（推荐）", "直接修改当前预制体" });
-        if (selectedSaveMode != saveMode)
-        {
-            saveMode = selectedSaveMode;
-        }
-
-        if (saveMode == SaveMode.ModifyOriginal)
-        {
-            EditorGUILayout.HelpBox(
-                "此模式会覆盖当前 Prefab 文件，未配置替换图的槽位仍会保持不变。执行前还会再次确认。",
-                MessageType.Warning);
-
-            if (PrefabUtility.GetPrefabAssetType(prefab) == PrefabAssetType.Variant)
-            {
-                EditorGUILayout.HelpBox(
-                    "当前是 Prefab Variant，覆盖时会写回当前变体并保留其继承关系。",
-                    MessageType.Info);
-            }
-        }
-
-        var outputPath = GetOutputPath(prefabPath);
-        EditorGUILayout.LabelField(saveMode == SaveMode.ModifyOriginal ? "目标" : "输出", outputPath, EditorStyles.miniLabel);
-
-        var currentIssues = BuildReviewIssues();
-        if (currentIssues.Count > 0 || GetUnconfiguredSlotCount() > 0)
-        {
-            EditorGUILayout.HelpBox(
-                BuildIssueSummary(currentIssues)
-                + "\n未配置替换图的槽位，以及 Image/RawImage 空或丢失引用会自动跳过；存在风险的槽位可在确认窗口中多选。",
-                MessageType.Warning);
-            DrawProblemDetails(currentIssues);
-        }
-
-        EditorGUILayout.LabelField(
-            string.Format("图片槽位：{0}    引用节点：{1}", slots.Count, slots.Sum(s => s.Usages.Count)),
-            EditorStyles.miniBoldLabel);
-
-        scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
-        foreach (var slot in slots)
-        {
-            if (!MatchesSearch(slot))
-            {
-                continue;
-            }
-
-            DrawSlot(slot);
-        }
-
-        if (slots.Count == 0 && scanProblems.Count == 0)
-        {
-            EditorGUILayout.HelpBox("没有找到 Image 或 RawImage 图片引用。", MessageType.Info);
-        }
-
-        EditorGUILayout.EndScrollView();
-
-        using (new EditorGUILayout.HorizontalScope())
-        {
-            GUILayout.FlexibleSpace();
-            using (new EditorGUI.DisabledScope(isBusy || isApplyQueued || slots.Count == 0))
-            {
-                var applyButtonLabel = saveMode == SaveMode.ModifyOriginal
-                    ? "直接修改当前 Prefab"
-                    : "生成替换 Prefab";
-                if (GUILayout.Button(applyButtonLabel, GUILayout.Width(150f), GUILayout.Height(28f)))
+                if (GUILayout.Button(
+                    new GUIContent("重扫并建立基线", "把对象当前状态记录为新的还原基线"),
+                    EditorStyles.toolbarButton,
+                    GUILayout.Width(104f)))
                 {
-                    QueuePrepareApply();
+                    RebuildBaseline(true);
+                }
+            }
+
+            using (new EditorGUI.DisabledScope(slots.Count == 0 || isRestoreQueued))
+            {
+                if (GUILayout.Button("还原全部", EditorStyles.toolbarButton, GUILayout.Width(68f)))
+                {
+                    RequestRestoreAll();
                 }
             }
         }
     }
 
-    private void QueuePrepareApply()
+    private void DrawSlotList(bool editingDisabled)
     {
-        if (isBusy || isApplyQueued)
+        var groups = BuildImageGroups();
+        var filteredGroups = BuildFilteredGroupViews(groups);
+        var invalidCount = slots.Count(slot => !slot.IsValid);
+        var configuredCount = slots.Count(slot => slot.HasAppliedReplacement);
+        EditorGUILayout.LabelField(
+            string.Format(
+                "图片组：{0}    引用：{1}    已应用：{2}    失效：{3}    当前显示组：{4}",
+                groups.Count,
+                slots.Count,
+                configuredCount,
+                invalidCount,
+                filteredGroups.Count),
+            EditorStyles.miniBoldLabel);
+
+        var pageCount = Mathf.Max(1, Mathf.CeilToInt(filteredGroups.Count / (float)PageSize));
+        currentPage = Mathf.Clamp(currentPage, 0, pageCount - 1);
+        DrawPagination(pageCount, filteredGroups.Count);
+
+        scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
+        var firstIndex = currentPage * PageSize;
+        var lastIndex = Mathf.Min(firstIndex + PageSize, filteredGroups.Count);
+        using (new EditorGUI.DisabledScope(editingDisabled))
         {
-            return;
+            for (var index = firstIndex; index < lastIndex; index++)
+            {
+                DrawImageGroup(filteredGroups[index]);
+            }
         }
 
-        isApplyQueued = true;
-        EditorApplication.delayCall += () =>
+        if (slots.Count == 0 && targetObject != null)
         {
-            isApplyQueued = false;
-            if (this != null)
-            {
-                PrepareApply();
-            }
-        };
-        GUIUtility.ExitGUI();
+            EditorGUILayout.HelpBox("这个对象的子树中没有找到已设置图片的 Image 或 RawImage。", MessageType.Info);
+        }
+        else if (filteredGroups.Count == 0)
+        {
+            EditorGUILayout.HelpBox("没有符合筛选条件的图片组或引用路径。", MessageType.Info);
+        }
+
+        EditorGUILayout.EndScrollView();
     }
 
-    private void DrawSlot(ImageSlot slot)
+    private void DrawPagination(int pageCount, int filteredCount)
+    {
+        using (new EditorGUILayout.HorizontalScope())
+        {
+            using (new EditorGUI.DisabledScope(currentPage <= 0))
+            {
+                if (GUILayout.Button("上一页", GUILayout.Width(58f)))
+                {
+                    currentPage--;
+                    scrollPosition = Vector2.zero;
+                }
+            }
+
+            EditorGUILayout.LabelField(
+                string.Format("第 {0}/{1} 页，每页 {2} 组，共 {3} 组", currentPage + 1, pageCount, PageSize, filteredCount),
+                EditorStyles.miniLabel);
+
+            using (new EditorGUI.DisabledScope(currentPage >= pageCount - 1))
+            {
+                if (GUILayout.Button("下一页", GUILayout.Width(58f)))
+                {
+                    currentPage++;
+                    scrollPosition = Vector2.zero;
+                }
+            }
+        }
+    }
+
+    private void DrawImageGroup(ImageGroupView view)
     {
         using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
         {
+            var group = view.Group;
+            var nativeWarningCount = CountNativeSizeWarnings(group.Slots);
+            var title = string.Format(
+                "{0}    引用 {1}    已应用 {2}    尺寸警告 {3}",
+                group.OriginalName,
+                group.Slots.Count,
+                group.AppliedCount,
+                nativeWarningCount);
+            EditorGUILayout.LabelField(new GUIContent(title, title), EditorStyles.boldLabel);
+
             EditorGUILayout.LabelField(
-                string.Format("{0}  ({1} 个引用)", slot.DisplayName, slot.Usages.Count),
-                EditorStyles.boldLabel);
-            EditorGUILayout.SelectableLabel(
-                "资源路径：" + slot.SourcePath,
-                EditorStyles.wordWrappedMiniLabel,
-                GUILayout.MinHeight(EditorGUIUtility.singleLineHeight));
+                new GUIContent("原图资源：" + group.SourcePath, group.SourcePath),
+                EditorStyles.wordWrappedMiniLabel);
 
             using (new EditorGUILayout.HorizontalScope())
             {
-                DrawPreview(slot.Source, "点击定位原图资源");
+                DrawPreview(group.OriginalSource, "点击定位原图资源");
                 using (new EditorGUILayout.VerticalScope())
                 {
-                    EditorGUILayout.LabelField(
-                        slot.SourceKind == SourceKind.Sprite ? "Image.sprite" : "RawImage.texture",
-                        EditorStyles.miniLabel);
-                    EditorGUILayout.LabelField("原图分辨率", slot.OriginalResolutionText, EditorStyles.miniLabel);
+                    EditorGUILayout.LabelField("原图分辨率", group.OriginalResolutionText, EditorStyles.miniLabel);
+                    EditorGUILayout.LabelField("替换图分辨率", group.ReplacementResolutionText, EditorStyles.miniLabel);
                 }
 
                 GUILayout.FlexibleSpace();
                 EditorGUI.BeginChangeCheck();
                 var replacement = (Sprite)EditorGUILayout.ObjectField(
-                    new GUIContent("替换 Sprite"), slot.Replacement, typeof(Sprite), false, GUILayout.Width(230f));
+                    new GUIContent("替换 Sprite"),
+                    group.Replacement,
+                    typeof(Sprite),
+                    false,
+                    GUILayout.Width(230f));
                 if (EditorGUI.EndChangeCheck())
                 {
-                    slot.Replacement = replacement;
+                    ChangeGroupReplacement(group, replacement);
                 }
-                if (replacement != null)
+
+                if (group.Replacement != null)
                 {
-                    DrawPreview(replacement, "点击定位槽位图资源");
+                    DrawPreview(group.Replacement, "点击定位替换图资源");
                 }
             }
 
-            if (slot.Replacement != null)
+            foreach (var warning in group.Warnings)
             {
-                EditorGUILayout.LabelField("槽位图分辨率", slot.ReplacementResolutionText, EditorStyles.miniLabel);
-                if (slot.HasResolutionMismatch)
+                EditorGUILayout.HelpBox(warning, MessageType.Warning);
+            }
+
+            var isExpanded = view.ForceExpanded || group.IsExpanded;
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                var usageLabel = view.ForceExpanded
+                    ? string.Format("匹配 {0} / 共 {1}", view.VisibleSlots.Count, group.Slots.Count)
+                    : string.Format("使用位置（{0}）", group.Slots.Count);
+                using (new EditorGUI.DisabledScope(view.ForceExpanded))
                 {
-                    EditorGUILayout.HelpBox(
-                        string.Format(
-                            "分辨率不一致：原图 {0}，槽位图 {1}。请确认缩放、裁剪和显示效果符合预期。",
-                            slot.OriginalResolutionText,
-                            slot.ReplacementResolutionText),
-                        MessageType.Warning);
+                    var newExpanded = EditorGUILayout.Foldout(
+                        isExpanded,
+                        usageLabel,
+                        true,
+                        EditorStyles.foldout);
+                    if (!view.ForceExpanded && newExpanded != group.IsExpanded)
+                    {
+                        SetGroupExpanded(group, newExpanded);
+                        isExpanded = newExpanded;
+                    }
+                }
+
+                GUILayout.FlexibleSpace();
+                using (new EditorGUI.DisabledScope(group.Replacement == null || isRestoreQueued))
+                {
+                    if (GUILayout.Button("还原本组", GUILayout.Width(80f)))
+                    {
+                        RequestGroupRestore(group);
+                    }
                 }
             }
 
-            slot.UsagesExpanded = EditorGUILayout.Foldout(
-                slot.UsagesExpanded,
-                string.Format("使用位置（{0} 个）", slot.Usages.Count),
-                true);
-            if (!slot.UsagesExpanded)
+            if (!isExpanded)
             {
                 return;
             }
 
-            foreach (var usage in slot.Usages)
+            EditorGUILayout.Space(2f);
+            foreach (var slot in view.VisibleSlots)
             {
-                using (new EditorGUILayout.HorizontalScope())
+                DrawUsageSlot(slot);
+            }
+        }
+    }
+
+    private void DrawUsageSlot(ImageSlot slot)
+    {
+        var isSelected = slot.IsValid && Selection.activeGameObject == slot.Component.gameObject;
+        var previousBackgroundColor = GUI.backgroundColor;
+        try
+        {
+            if (isSelected)
+            {
+                GUI.backgroundColor = new Color(0.45f, 0.72f, 1f);
+            }
+
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                if (!slot.IsValid)
                 {
-                    GUILayout.Space(8f);
-                    var state = usage.Writable ? string.Empty : "（嵌套 Prefab，只读）";
-                    EditorGUILayout.LabelField(
-                        usage.Path + "  [" + usage.ComponentProperty + "] " + state,
-                        EditorStyles.miniLabel);
+                    EditorGUILayout.LabelField(slot.Path + "  [" + slot.ComponentLabel + "]", EditorStyles.wordWrappedMiniLabel);
+                    EditorGUILayout.HelpBox("该组件或节点已经失效。重新扫描后会从列表中清理。", MessageType.Warning);
+                }
+                else
+                {
+                    var title = slot.Path + "  [" + slot.ComponentLabel + "]";
+                    if (GUILayout.Button(new GUIContent(title, "点击选中物体并在 Scene 视图中定位"), PathButtonStyle))
+                    {
+                        SelectAndFrame(slot);
+                    }
+
+                    Vector2 currentSize;
+                    Vector2 nativeSize;
+                    if (TryGetNativeSizeMismatch(slot, out currentSize, out nativeSize))
+                    {
+                        EditorGUILayout.HelpBox(
+                            string.Format(
+                                "警告：当前尺寸 {0}，Unity Native Size {1}，宽或高的差值超过 {2:0.##}。",
+                                FormatSize(currentSize),
+                                FormatSize(nativeSize),
+                                NativeSizeWarningThreshold),
+                            MessageType.Warning);
+                    }
+
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        EditorGUILayout.LabelField(
+                            slot.IsReplacementApplied ? "状态：已应用组替换" : "状态：原图 / 已还原",
+                            EditorStyles.miniLabel);
+
+                        GUILayout.FlexibleSpace();
+                        using (new EditorGUI.DisabledScope(!slot.HasAppliedReplacement))
+                        {
+                            EditorGUI.BeginChangeCheck();
+                            var useNativeSize = EditorGUILayout.ToggleLeft(
+                                new GUIContent("Set Native Size", "勾选后立即按替换图片设置原尺寸；取消后恢复该物体的基线布局"),
+                                slot.UseNativeSize,
+                                GUILayout.Width(130f));
+                            if (EditorGUI.EndChangeCheck())
+                            {
+                                ChangeNativeSize(slot, useNativeSize);
+                            }
+                        }
+
+                        if (GUILayout.Button("还原", GUILayout.Width(58f)))
+                        {
+                            RestoreSlot(slot);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            GUI.backgroundColor = previousBackgroundColor;
+        }
+    }
+
+    private void DrawSaveControls(bool editingDisabled)
+    {
+        string sourcePath;
+        var hasSourcePrefab = TryGetModifiableSourcePrefabPath(out sourcePath);
+        var hasAppliedReplacement = slots.Any(slot => slot.HasAppliedReplacement);
+        if (hasSourcePrefab)
+        {
+            EditorGUILayout.LabelField("源 Prefab", sourcePath, EditorStyles.miniLabel);
+            if (!hasAppliedReplacement)
+            {
+                EditorGUILayout.HelpBox("修改源 Prefab 不可用：当前没有已应用的替换。", MessageType.Warning);
+            }
+            else
+            {
+                EditorGUILayout.LabelField(
+                    "仅写入当前仍应用组替换的图片引用和原尺寸结果。",
+                    EditorStyles.wordWrappedMiniLabel);
+            }
+        }
+        else if (targetObject == null)
+        {
+            EditorGUILayout.HelpBox("修改源 Prefab 不可用：请先选择有效的场景对象。", MessageType.Warning);
+        }
+        else
+        {
+            EditorGUILayout.HelpBox(
+                "修改源 Prefab 不可用：扫描对象必须是 Prefab 实例根节点。",
+                MessageType.Warning);
+        }
+
+        using (new EditorGUILayout.HorizontalScope())
+        {
+            GUILayout.FlexibleSpace();
+            var canCreate = targetObject != null && !isSaveQueued;
+            using (new EditorGUI.DisabledScope(editingDisabled || !canCreate))
+            {
+                if (GUILayout.Button("生成新 Prefab", GUILayout.Width(150f), GUILayout.Height(28f)))
+                {
+                    QueueSave(SaveMode.CreateNew);
+                }
+            }
+
+            GUILayout.Space(4f);
+            var canModify = targetObject != null
+                && !isSaveQueued
+                && hasSourcePrefab
+                && hasAppliedReplacement;
+            using (new EditorGUI.DisabledScope(editingDisabled || !canModify))
+            {
+                if (GUILayout.Button("修改源 Prefab", GUILayout.Width(150f), GUILayout.Height(28f)))
+                {
+                    QueueSave(SaveMode.ModifySource);
                 }
             }
         }
     }
 
-    private void DrawPreview(UnityEngine.Object source, string tooltip)
+    private List<ImageGroup> BuildImageGroups()
+    {
+        var groups = new List<ImageGroup>();
+        var groupsBySource = new Dictionary<UnityEngine.Object, ImageGroup>();
+        foreach (var slot in slots.Where(slot => slot.OriginalSource != null))
+        {
+            ImageGroup group;
+            if (!groupsBySource.TryGetValue(slot.OriginalSource, out group))
+            {
+                group = new ImageGroup(slot.OriginalSource);
+                groupsBySource.Add(slot.OriginalSource, group);
+                groups.Add(group);
+            }
+
+            group.Slots.Add(slot);
+        }
+
+        return groups
+            .OrderBy(group => group.OriginalName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(group => group.SourcePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private List<ImageGroupView> BuildFilteredGroupViews(List<ImageGroup> groups)
+    {
+        if (string.IsNullOrWhiteSpace(searchText))
+        {
+            return groups.Select(group => new ImageGroupView(group, group.Slots, false)).ToList();
+        }
+
+        var query = searchText.Trim();
+        var views = new List<ImageGroupView>();
+        foreach (var group in groups)
+        {
+            if (group.OriginalName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+                || group.SourcePath.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                views.Add(new ImageGroupView(group, group.Slots, false));
+                continue;
+            }
+
+            var matchingSlots = group.Slots
+                .Where(slot => slot.Path.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+                    || slot.ComponentLabel.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
+                .ToList();
+            if (matchingSlots.Count > 0)
+            {
+                views.Add(new ImageGroupView(group, matchingSlots, true));
+            }
+        }
+
+        return views;
+    }
+
+    private void SetGroupExpanded(ImageGroup group, bool isExpanded)
+    {
+        foreach (var slot in group.Slots)
+        {
+            slot.GroupExpanded = isExpanded;
+        }
+
+        PersistSession();
+    }
+
+    private void ChangeGroupReplacement(ImageGroup group, Sprite replacement)
+    {
+        if (group.Slots.Any(slot => slot.Kind == SlotKind.RawImage)
+            && replacement != null
+            && !IsWholeTextureSprite(replacement))
+        {
+            foreach (var slot in group.Slots)
+            {
+                slot.Warning = "RawImage 只接受未打包且覆盖完整纹理的 Sprite；图集子 Sprite 不会被应用。";
+            }
+
+            PersistSession();
+            Repaint();
+            return;
+        }
+
+        var actionName = replacement == null ? "还原图片组" : "预览替换图片组";
+        Undo.IncrementCurrentGroup();
+        var undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName(actionName);
+        Undo.RecordObject(this, actionName);
+        var objects = group.Slots
+            .Where(slot => slot.IsValid)
+            .SelectMany(slot => new UnityEngine.Object[] { slot.Component, slot.RectTransform })
+            .Where(item => item != null)
+            .Distinct()
+            .ToArray();
+        if (objects.Length > 0)
+        {
+            Undo.RecordObjects(objects, actionName);
+        }
+
+        foreach (var slot in group.Slots)
+        {
+            slot.Warning = string.Empty;
+            slot.Replacement = replacement;
+            slot.IsReplacementApplied = replacement != null && slot.IsValid;
+            if (replacement == null)
+            {
+                slot.UseNativeSize = false;
+                if (slot.IsValid)
+                {
+                    RestoreSlotState(slot);
+                }
+            }
+            else if (slot.IsValid)
+            {
+                ApplyPreviewState(slot);
+            }
+
+            if (slot.IsValid)
+            {
+                MarkSceneObjectsChanged(slot);
+            }
+        }
+
+        EditorUtility.SetDirty(this);
+        Undo.CollapseUndoOperations(undoGroup);
+        PersistSession();
+        Repaint();
+    }
+
+    private void ChangeNativeSize(ImageSlot slot, bool useNativeSize)
+    {
+        if (!slot.HasAppliedReplacement)
+        {
+            return;
+        }
+
+        var undoGroup = BeginSlotUndo(slot, useNativeSize ? "设置图片原尺寸" : "恢复图片布局");
+        slot.UseNativeSize = useNativeSize;
+        ApplyPreviewState(slot);
+        FinishSlotChange(slot, undoGroup);
+    }
+
+    private void RestoreSlot(ImageSlot slot)
+    {
+        if (!slot.IsValid)
+        {
+            return;
+        }
+
+        var undoGroup = BeginSlotUndo(slot, "还原图片槽位");
+        slot.IsReplacementApplied = false;
+        slot.UseNativeSize = false;
+        slot.Warning = string.Empty;
+        RestoreSlotState(slot);
+        FinishSlotChange(slot, undoGroup);
+    }
+
+    private void RequestGroupRestore(ImageGroup group)
+    {
+        if (isRestoreQueued || group == null || group.Replacement == null)
+        {
+            return;
+        }
+
+        var slotsAtRequest = slots;
+        var sourceAtRequest = group.OriginalSource;
+        isRestoreQueued = true;
+        EditorApplication.delayCall += () =>
+        {
+            if (this == null)
+            {
+                return;
+            }
+
+            isRestoreQueued = false;
+            if (EditorApplication.isPlayingOrWillChangePlaymode
+                || !hasSession
+                || !ReferenceEquals(slots, slotsAtRequest))
+            {
+                Repaint();
+                return;
+            }
+
+            var currentGroup = BuildImageGroups()
+                .FirstOrDefault(item => item.OriginalSource == sourceAtRequest);
+            if (currentGroup == null || currentGroup.Replacement == null)
+            {
+                Repaint();
+                return;
+            }
+
+            if (!EditorUtility.DisplayDialog(
+                    "还原图片组",
+                    string.Format("确定还原“{0}”的全部 {1} 个使用位置吗？", currentGroup.OriginalName, currentGroup.Slots.Count),
+                    "还原",
+                    "取消"))
+            {
+                Repaint();
+                return;
+            }
+
+            ChangeGroupReplacement(currentGroup, null);
+        };
+        GUIUtility.ExitGUI();
+    }
+
+    private void RequestRestoreAll()
+    {
+        if (isRestoreQueued || slots.Count == 0)
+        {
+            return;
+        }
+
+        var slotsAtRequest = slots;
+        isRestoreQueued = true;
+        EditorApplication.delayCall += () =>
+        {
+            if (this == null)
+            {
+                return;
+            }
+
+            isRestoreQueued = false;
+            if (EditorApplication.isPlayingOrWillChangePlaymode
+                || !hasSession
+                || !ReferenceEquals(slots, slotsAtRequest)
+                || slots.Count == 0)
+            {
+                Repaint();
+                return;
+            }
+
+            if (!EditorUtility.DisplayDialog(
+                    "还原全部图片",
+                    string.Format("确定还原当前会话中的全部 {0} 个使用位置吗？", slots.Count),
+                    "还原全部",
+                    "取消"))
+            {
+                Repaint();
+                return;
+            }
+
+            RestoreAllSlots();
+        };
+        GUIUtility.ExitGUI();
+    }
+
+    private void RestoreAllSlots()
+    {
+        Undo.IncrementCurrentGroup();
+        var undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName("还原全部图片槽位");
+        Undo.RecordObject(this, "还原全部图片槽位");
+
+        var objects = slots
+            .Where(slot => slot.IsValid)
+            .SelectMany(slot => new UnityEngine.Object[] { slot.Component, slot.RectTransform })
+            .Where(item => item != null)
+            .Distinct()
+            .ToArray();
+        if (objects.Length > 0)
+        {
+            Undo.RecordObjects(objects, "还原全部图片槽位");
+        }
+
+        foreach (var slot in slots)
+        {
+            slot.Replacement = null;
+            slot.IsReplacementApplied = false;
+            slot.UseNativeSize = false;
+            slot.Warning = string.Empty;
+            if (slot.IsValid)
+            {
+                RestoreSlotState(slot);
+                MarkSceneObjectsChanged(slot);
+            }
+        }
+
+        EditorUtility.SetDirty(this);
+        Undo.CollapseUndoOperations(undoGroup);
+        PersistSession();
+        Repaint();
+    }
+
+    private int BeginSlotUndo(ImageSlot slot, string actionName)
+    {
+        Undo.IncrementCurrentGroup();
+        var undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName(actionName);
+        Undo.RecordObject(this, actionName);
+        Undo.RecordObject(slot.Component, actionName);
+        Undo.RecordObject(slot.RectTransform, actionName);
+        return undoGroup;
+    }
+
+    private void FinishSlotChange(ImageSlot slot, int undoGroup)
+    {
+        MarkSceneObjectsChanged(slot);
+        EditorUtility.SetDirty(this);
+        Undo.CollapseUndoOperations(undoGroup);
+        PersistSession();
+        Repaint();
+    }
+
+    private static void ApplyPreviewState(ImageSlot slot)
+    {
+        slot.OriginalRect.Apply(slot.RectTransform);
+        if (slot.Kind == SlotKind.Image)
+        {
+            var image = (Image)slot.Component;
+            image.sprite = slot.Replacement;
+            if (slot.UseNativeSize)
+            {
+                image.SetNativeSize();
+            }
+        }
+        else
+        {
+            var rawImage = (RawImage)slot.Component;
+            rawImage.texture = slot.Replacement == null ? null : slot.Replacement.texture;
+            if (slot.UseNativeSize)
+            {
+                rawImage.SetNativeSize();
+            }
+        }
+    }
+
+    private static void RestoreSlotState(ImageSlot slot)
+    {
+        slot.OriginalRect.Apply(slot.RectTransform);
+        if (slot.Kind == SlotKind.Image)
+        {
+            ((Image)slot.Component).sprite = slot.OriginalSource as Sprite;
+        }
+        else
+        {
+            ((RawImage)slot.Component).texture = slot.OriginalSource as Texture;
+        }
+    }
+
+    private static void MarkSceneObjectsChanged(ImageSlot slot)
+    {
+        EditorUtility.SetDirty(slot.Component);
+        EditorUtility.SetDirty(slot.RectTransform);
+        PrefabUtility.RecordPrefabInstancePropertyModifications(slot.Component);
+        PrefabUtility.RecordPrefabInstancePropertyModifications(slot.RectTransform);
+        var scene = slot.Component.gameObject.scene;
+        if (scene.IsValid())
+        {
+            EditorSceneManager.MarkSceneDirty(scene);
+        }
+    }
+
+    private void RebuildBaseline(bool preserveGroupExpansion)
+    {
+        if (targetObject == null)
+        {
+            return;
+        }
+
+        string error;
+        if (!IsValidSceneTarget(targetObject, out error))
+        {
+            targetError = error;
+            return;
+        }
+
+        targetError = string.Empty;
+        targetDisplayName = targetObject.scene.name + ": " + BuildTransformPath(targetObject.transform, null);
+        var expandedBySource = preserveGroupExpansion
+            ? slots.Where(slot => slot.OriginalSource != null)
+                .GroupBy(slot => slot.OriginalSource)
+                .ToDictionary(group => group.Key, group => group.Any(slot => slot.GroupExpanded))
+            : new Dictionary<UnityEngine.Object, bool>();
+        var newSlots = new List<ImageSlot>();
+
+        foreach (var image in targetObject.GetComponentsInChildren<Image>(true))
+        {
+            if (image.sprite != null)
+            {
+                newSlots.Add(CreateSlot(image, SlotKind.Image, expandedBySource));
+            }
+        }
+
+        foreach (var rawImage in targetObject.GetComponentsInChildren<RawImage>(true))
+        {
+            if (rawImage.texture != null)
+            {
+                newSlots.Add(CreateSlot(rawImage, SlotKind.RawImage, expandedBySource));
+            }
+        }
+
+        slots = newSlots
+            .OrderBy(slot => slot.Path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(slot => slot.Kind)
+            .ThenBy(slot => slot.ComponentIndex)
+            .ToList();
+        currentPage = 0;
+        scrollPosition = Vector2.zero;
+        hasSession = true;
+        PersistSession();
+        Repaint();
+    }
+
+    private ImageSlot CreateSlot(
+        Component component,
+        SlotKind kind,
+        Dictionary<UnityEngine.Object, bool> expandedBySource)
+    {
+        var originalSource = kind == SlotKind.Image
+            ? (UnityEngine.Object)((Image)component).sprite
+            : ((RawImage)component).texture;
+        var components = kind == SlotKind.Image
+            ? component.gameObject.GetComponents<Image>().Cast<Component>().ToArray()
+            : component.gameObject.GetComponents<RawImage>().Cast<Component>().ToArray();
+
+        bool groupExpanded;
+        expandedBySource.TryGetValue(originalSource, out groupExpanded);
+        return new ImageSlot
+        {
+            Component = component,
+            Kind = kind,
+            Path = BuildTransformPath(component.transform, targetObject.transform),
+            OriginalSource = originalSource,
+            OriginalRect = RectTransformSnapshot.Capture((RectTransform)component.transform),
+            Locator = BuildTransformLocator(component.transform, targetObject.transform),
+            ComponentIndex = Array.IndexOf(components, component),
+            Replacement = null,
+            IsReplacementApplied = false,
+            UseNativeSize = false,
+            GroupExpanded = groupExpanded,
+            Warning = string.Empty
+        };
+    }
+
+    private void QueueSave(SaveMode mode)
+    {
+        if (isSaveQueued)
+        {
+            return;
+        }
+
+        var targetAtRequest = targetObject;
+        var slotsAtRequest = slots;
+        isSaveQueued = true;
+        EditorApplication.delayCall += () =>
+        {
+            if (this == null)
+            {
+                return;
+            }
+
+            isSaveQueued = false;
+            if (EditorApplication.isPlayingOrWillChangePlaymode
+                || !hasSession
+                || targetObject != targetAtRequest
+                || !ReferenceEquals(slots, slotsAtRequest))
+            {
+                Repaint();
+                return;
+            }
+
+            if (mode == SaveMode.ModifySource)
+            {
+                SaveConfiguredChangesToSourcePrefab();
+            }
+            else
+            {
+                SaveCurrentSubtreeAsNewPrefab();
+            }
+
+            Repaint();
+        };
+        GUIUtility.ExitGUI();
+    }
+
+    private void SaveCurrentSubtreeAsNewPrefab()
+    {
+        if (targetObject == null)
+        {
+            return;
+        }
+
+        var outputPath = EditorUtility.SaveFilePanelInProject(
+            "保存新 Prefab",
+            targetObject.name + OutputSuffix,
+            "prefab",
+            "选择新 Prefab 的保存位置");
+        if (string.IsNullOrEmpty(outputPath))
+        {
+            return;
+        }
+
+        bool succeeded;
+        var savedPrefab = PrefabUtility.SaveAsPrefabAsset(targetObject, outputPath, out succeeded);
+        if (!succeeded || savedPrefab == null)
+        {
+            EditorUtility.DisplayDialog("保存失败", "Unity 未能保存新 Prefab。请检查路径和 Console。", "确定");
+            return;
+        }
+
+        Selection.activeObject = savedPrefab;
+        EditorGUIUtility.PingObject(savedPrefab);
+        EditorUtility.DisplayDialog("保存完成", "已生成：" + outputPath, "确定");
+    }
+
+    private void SaveConfiguredChangesToSourcePrefab()
+    {
+        string sourcePath;
+        if (!TryGetModifiableSourcePrefabPath(out sourcePath))
+        {
+            EditorUtility.DisplayDialog("无法修改", "拖入对象不是 Prefab 实例根节点。", "确定");
+            return;
+        }
+
+        var configuredSlots = slots
+            .Where(slot => slot.HasAppliedReplacement)
+            .ToList();
+        if (configuredSlots.Count == 0)
+        {
+            EditorUtility.DisplayDialog("没有修改", "当前没有仍在应用的有效替换 Sprite。", "确定");
+            return;
+        }
+
+        if (!EditorUtility.DisplayDialog(
+                "确认修改源 Prefab",
+                "将只写入当前仍应用组替换的图片引用与原尺寸结果：\n" + sourcePath,
+                "修改",
+                "取消"))
+        {
+            return;
+        }
+
+        GameObject prefabRoot = null;
+        try
+        {
+            prefabRoot = PrefabUtility.LoadPrefabContents(sourcePath);
+            var appliedCount = 0;
+            var skippedCount = 0;
+            var wasCanceled = false;
+            for (var slotIndex = 0; slotIndex < configuredSlots.Count; slotIndex++)
+            {
+                var slot = configuredSlots[slotIndex];
+                if (EditorUtility.DisplayCancelableProgressBar(
+                        "修改源 Prefab",
+                        slot.Path,
+                        slotIndex / (float)configuredSlots.Count))
+                {
+                    wasCanceled = true;
+                    break;
+                }
+
+                var targetTransform = FindTransform(prefabRoot.transform, slot.Locator);
+                var targetComponent = FindComponent(targetTransform, slot.Kind, slot.ComponentIndex);
+                if (targetComponent == null)
+                {
+                    skippedCount++;
+                    continue;
+                }
+
+                if (slot.Kind == SlotKind.Image)
+                {
+                    var image = (Image)targetComponent;
+                    image.sprite = slot.Replacement;
+                    if (slot.UseNativeSize)
+                    {
+                        image.SetNativeSize();
+                        EditorUtility.SetDirty(image.rectTransform);
+                        PrefabUtility.RecordPrefabInstancePropertyModifications(image.rectTransform);
+                    }
+                }
+                else
+                {
+                    var rawImage = (RawImage)targetComponent;
+                    rawImage.texture = slot.Replacement.texture;
+                    if (slot.UseNativeSize)
+                    {
+                        rawImage.SetNativeSize();
+                        EditorUtility.SetDirty(rawImage.rectTransform);
+                        PrefabUtility.RecordPrefabInstancePropertyModifications(rawImage.rectTransform);
+                    }
+                }
+
+                EditorUtility.SetDirty(targetComponent);
+                PrefabUtility.RecordPrefabInstancePropertyModifications(targetComponent);
+                appliedCount++;
+            }
+
+            if (wasCanceled)
+            {
+                EditorUtility.DisplayDialog("操作已取消", "源 Prefab 未保存。", "确定");
+                return;
+            }
+
+            bool succeeded;
+            var savedPrefab = PrefabUtility.SaveAsPrefabAsset(prefabRoot, sourcePath, out succeeded);
+            if (!succeeded || savedPrefab == null)
+            {
+                throw new InvalidOperationException("Unity 未能保存源 Prefab。");
+            }
+
+            Selection.activeObject = savedPrefab;
+            EditorGUIUtility.PingObject(savedPrefab);
+            EditorUtility.DisplayDialog(
+                "修改完成",
+                string.Format("源 Prefab：{0}\n已写入槽位：{1}\n定位失败并跳过：{2}", sourcePath, appliedCount, skippedCount),
+                "确定");
+        }
+        catch (Exception exception)
+        {
+            Debug.LogException(exception);
+            EditorUtility.DisplayDialog("修改失败", exception.Message, "确定");
+        }
+        finally
+        {
+            EditorUtility.ClearProgressBar();
+            if (prefabRoot != null)
+            {
+                PrefabUtility.UnloadPrefabContents(prefabRoot);
+            }
+        }
+    }
+
+    private bool TryGetModifiableSourcePrefabPath(out string sourcePath)
+    {
+        sourcePath = string.Empty;
+        if (targetObject == null || !PrefabUtility.IsPartOfPrefabInstance(targetObject))
+        {
+            return false;
+        }
+
+        var instanceRoot = PrefabUtility.GetOutermostPrefabInstanceRoot(targetObject);
+        if (instanceRoot != targetObject)
+        {
+            return false;
+        }
+
+        sourcePath = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(targetObject);
+        return !string.IsNullOrEmpty(sourcePath);
+    }
+
+    private static Component FindComponent(Transform transform, SlotKind kind, int componentIndex)
+    {
+        if (transform == null || componentIndex < 0)
+        {
+            return null;
+        }
+
+        if (kind == SlotKind.Image)
+        {
+            var images = transform.GetComponents<Image>();
+            return componentIndex < images.Length ? images[componentIndex] : null;
+        }
+
+        var rawImages = transform.GetComponents<RawImage>();
+        return componentIndex < rawImages.Length ? rawImages[componentIndex] : null;
+    }
+
+    private static Transform FindTransform(Transform root, List<TransformLocatorStep> locator)
+    {
+        var current = root;
+        foreach (var step in locator)
+        {
+            var sameNameIndex = 0;
+            Transform match = null;
+            for (var childIndex = 0; childIndex < current.childCount; childIndex++)
+            {
+                var child = current.GetChild(childIndex);
+                if (!string.Equals(child.name, step.Name, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (sameNameIndex == step.SameNameIndex)
+                {
+                    match = child;
+                    break;
+                }
+
+                sameNameIndex++;
+            }
+
+            if (match == null)
+            {
+                return null;
+            }
+
+            current = match;
+        }
+
+        return current;
+    }
+
+    private static List<TransformLocatorStep> BuildTransformLocator(Transform transform, Transform root)
+    {
+        var reversed = new List<TransformLocatorStep>();
+        var current = transform;
+        while (current != null && current != root)
+        {
+            var sameNameIndex = 0;
+            var parent = current.parent;
+            if (parent != null)
+            {
+                for (var index = 0; index < current.GetSiblingIndex(); index++)
+                {
+                    if (string.Equals(parent.GetChild(index).name, current.name, StringComparison.Ordinal))
+                    {
+                        sameNameIndex++;
+                    }
+                }
+            }
+
+            reversed.Add(new TransformLocatorStep { Name = current.name, SameNameIndex = sameNameIndex });
+            current = parent;
+        }
+
+        reversed.Reverse();
+        return reversed;
+    }
+
+    private static bool IsValidSceneTarget(GameObject candidate, out string error)
+    {
+        if (candidate == null)
+        {
+            error = "场景对象为空。";
+            return false;
+        }
+
+        if (EditorUtility.IsPersistent(candidate))
+        {
+            error = "这里只接受场景中的对象实例，不能拖入 Project 里的 Prefab 资产。";
+            return false;
+        }
+
+        if (!candidate.scene.IsValid() || !candidate.scene.isLoaded)
+        {
+            error = "对象不属于当前已加载场景。";
+            return false;
+        }
+
+        if (EditorSceneManager.IsPreviewSceneObject(candidate))
+        {
+            error = "不支持 Preview Scene 或 Prefab Stage 中的对象，请拖入普通场景对象。";
+            return false;
+        }
+
+        error = string.Empty;
+        return true;
+    }
+
+    private static bool IsWholeTextureSprite(Sprite sprite)
+    {
+        if (sprite == null || sprite.texture == null || sprite.packed)
+        {
+            return false;
+        }
+
+        var rect = sprite.rect;
+        return Mathf.Approximately(rect.x, 0f)
+            && Mathf.Approximately(rect.y, 0f)
+            && Mathf.Approximately(rect.width, sprite.texture.width)
+            && Mathf.Approximately(rect.height, sprite.texture.height);
+    }
+
+    private static int CountNativeSizeWarnings(IEnumerable<ImageSlot> groupSlots)
+    {
+        var warningCount = 0;
+        foreach (var slot in groupSlots)
+        {
+            Vector2 currentSize;
+            Vector2 nativeSize;
+            if (TryGetNativeSizeMismatch(slot, out currentSize, out nativeSize))
+            {
+                warningCount++;
+            }
+        }
+
+        return warningCount;
+    }
+
+    private static bool TryGetNativeSizeMismatch(ImageSlot slot, out Vector2 currentSize, out Vector2 nativeSize)
+    {
+        currentSize = Vector2.zero;
+        nativeSize = Vector2.zero;
+        if (!slot.IsValid)
+        {
+            return false;
+        }
+
+        currentSize = slot.RectTransform.rect.size;
+        if (slot.Kind == SlotKind.Image)
+        {
+            var image = (Image)slot.Component;
+            var activeSprite = image.overrideSprite != null ? image.overrideSprite : image.sprite;
+            if (activeSprite == null || image.pixelsPerUnit <= 0f)
+            {
+                return false;
+            }
+
+            nativeSize = activeSprite.rect.size / image.pixelsPerUnit;
+        }
+        else
+        {
+            var rawImage = (RawImage)slot.Component;
+            var texture = rawImage.mainTexture;
+            if (texture == null)
+            {
+                return false;
+            }
+
+            nativeSize = new Vector2(
+                Mathf.RoundToInt(texture.width * rawImage.uvRect.width),
+                Mathf.RoundToInt(texture.height * rawImage.uvRect.height));
+        }
+
+        return Mathf.Abs(currentSize.x - nativeSize.x) > NativeSizeWarningThreshold
+            || Mathf.Abs(currentSize.y - nativeSize.y) > NativeSizeWarningThreshold;
+    }
+
+    private static string FormatSize(Vector2 size)
+    {
+        return string.Format("{0:0.##} x {1:0.##}", size.x, size.y);
+    }
+
+    private static void SelectAndFrame(ImageSlot slot)
+    {
+        if (!slot.IsValid)
+        {
+            return;
+        }
+
+        Selection.activeGameObject = slot.Component.gameObject;
+        if (SceneView.lastActiveSceneView != null)
+        {
+            SceneView.lastActiveSceneView.FrameSelected();
+        }
+    }
+
+    private static void DrawPreview(UnityEngine.Object source, string tooltip)
     {
         var previewRect = GUILayoutUtility.GetRect(
             PreviewSize,
@@ -287,26 +1386,19 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         EditorGUI.DrawRect(previewRect, new Color(0.16f, 0.16f, 0.16f));
 
         var sprite = source as Sprite;
-        if (sprite != null && sprite.texture != null
-            && sprite.texture.width > 0 && sprite.texture.height > 0)
+        if (sprite != null && sprite.texture != null && sprite.rect.height > 0f)
         {
-            var texture = sprite.texture;
-            var uv = GetSpriteUvRect(sprite, texture);
+            var uv = GetSpriteUvRect(sprite, sprite.texture);
             var fittedRect = GetAspectFittedRect(previewRect, sprite.rect.width / sprite.rect.height);
-            GUI.DrawTextureWithTexCoords(fittedRect, texture, uv, true);
+            GUI.DrawTextureWithTexCoords(fittedRect, sprite.texture, uv, true);
         }
-        else if (source is Texture && ((Texture)source).width > 0 && ((Texture)source).height > 0)
+        else
         {
-            var texture = (Texture)source;
-            var fittedRect = GetAspectFittedRect(previewRect, (float)texture.width / texture.height);
-            EditorGUI.DrawPreviewTexture(fittedRect, texture, null, ScaleMode.ScaleToFit);
-        }
-        else if (source != null)
-        {
-            var preview = AssetPreview.GetAssetPreview(source);
-            if (preview != null)
+            var texture = source as Texture;
+            if (texture != null && texture.width > 0 && texture.height > 0)
             {
-                EditorGUI.DrawPreviewTexture(previewRect, preview, null, ScaleMode.ScaleToFit);
+                var fittedRect = GetAspectFittedRect(previewRect, (float)texture.width / texture.height);
+                EditorGUI.DrawPreviewTexture(fittedRect, texture, null, ScaleMode.ScaleToFit);
             }
         }
 
@@ -329,8 +1421,6 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 sprite.rect.height / texture.height);
         }
 
-        // Packed and tightly packed Sprites can throw when textureRect is read.
-        // UV bounds always identify the actual region inside the atlas texture.
         var uvs = sprite.uv;
         if (uvs == null || uvs.Length == 0)
         {
@@ -389,419 +1479,85 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         return new Rect(container.x + (container.width - width) * 0.5f, container.y, width, container.height);
     }
 
-    private bool MatchesSearch(ImageSlot slot)
+    private void ClearSession()
     {
-        if (string.IsNullOrWhiteSpace(searchText))
-        {
-            return true;
-        }
-
-        var query = searchText.Trim();
-        return slot.DisplayName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
-            || slot.SourcePath.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
-            || slot.Usages.Any(u => u.Path.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
-    }
-
-    private void ScanPrefab()
-    {
+        targetObject = null;
+        targetDisplayName = string.Empty;
+        targetError = string.Empty;
         slots = new List<ImageSlot>();
-        scanProblems = new List<ScanProblem>();
-        hasScanned = false;
+        currentPage = 0;
+        scrollPosition = Vector2.zero;
+        hasSession = false;
+        SessionState.EraseString(SessionKey);
+        Repaint();
+    }
 
-        if (prefab == null)
+    private void PersistSession()
+    {
+        if (!hasSession)
+        {
+            SessionState.EraseString(SessionKey);
+            return;
+        }
+
+        var data = new SessionData
+        {
+            Version = SessionVersion,
+            HasSession = true,
+            Target = ObjectReferenceData.Capture(targetObject),
+            TargetDisplayName = targetDisplayName,
+            SearchText = searchText,
+            CurrentPage = currentPage,
+            Slots = slots.Select(PersistedSlotData.Capture).ToList()
+        };
+        serializedVersion = SessionVersion;
+        SessionState.SetString(SessionKey, JsonUtility.ToJson(data));
+    }
+
+    private void RestoreSession()
+    {
+        var json = SessionState.GetString(SessionKey, string.Empty);
+        if (string.IsNullOrEmpty(json))
         {
             return;
         }
 
-        var path = AssetDatabase.GetAssetPath(prefab);
-        if (string.IsNullOrEmpty(path) || !path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        isBusy = true;
         try
         {
-            // Read the imported prefab asset directly. Opening an isolated prefab contents
-            // scene can deserialize stale cross-prefab PPtrs into Library/Unused and emit
-            // noisy Unity errors before the image references are even inspected.
-            var root = prefab;
-            var byKey = new Dictionary<string, ImageSlot>(StringComparer.Ordinal);
-            foreach (var image in root.GetComponentsInChildren<Image>(true))
+            var data = JsonUtility.FromJson<SessionData>(json);
+            if (data == null || !data.HasSession)
             {
-                if (image.sprite == null)
-                {
-                    scanProblems.Add(new ScanProblem(
-                        IssueKind.ImageMissingReference,
-                        BuildTransformPath(image.transform, root.transform),
-                        "Image.sprite 为空或丢失引用"));
-                    continue;
-                }
-
-                AddUsage(byKey, image.sprite, SourceKind.Sprite, image.gameObject,
-                    BuildTransformPath(image.transform, root.transform), "Image.sprite", root);
-            }
-
-            foreach (var rawImage in root.GetComponentsInChildren<RawImage>(true))
-            {
-                if (rawImage.texture == null)
-                {
-                    scanProblems.Add(new ScanProblem(
-                        IssueKind.RawImageMissingReference,
-                        BuildTransformPath(rawImage.transform, root.transform),
-                        "RawImage.texture 为空或丢失引用"));
-                    continue;
-                }
-
-                AddUsage(byKey, rawImage.texture, SourceKind.Texture, rawImage.gameObject,
-                    BuildTransformPath(rawImage.transform, root.transform), "RawImage.texture", root);
-            }
-
-            slots = byKey.Values.OrderBy(s => s.DisplayName, StringComparer.OrdinalIgnoreCase).ToList();
-
-            scannedDependencyHash = AssetDatabase.GetAssetDependencyHash(path);
-            hasScanned = true;
-        }
-        catch (Exception exception)
-        {
-            scanProblems.Add(new ScanProblem(
-                IssueKind.ScanFailure,
-                path,
-                "扫描失败：" + exception.Message));
-            Debug.LogException(exception);
-        }
-        finally
-        {
-            isBusy = false;
-            Repaint();
-        }
-    }
-
-    private static void AddUsage(
-        Dictionary<string, ImageSlot> byKey,
-        UnityEngine.Object source,
-        SourceKind sourceKind,
-        GameObject gameObject,
-        string path,
-        string componentProperty,
-        GameObject prefabRoot)
-    {
-        var key = GetAssetKey(source);
-        ImageSlot slot;
-        if (!byKey.TryGetValue(key, out slot))
-        {
-            slot = new ImageSlot(key, source, sourceKind);
-            byKey.Add(key, slot);
-        }
-
-        slot.Usages.Add(new ImageUsage(
-            path,
-            componentProperty,
-            IsDirectlyWritable(gameObject, prefabRoot)));
-    }
-
-    private void PrepareApply()
-    {
-        if (prefab == null || slots.Count == 0)
-        {
-            return;
-        }
-
-        if (scanProblems.Any(problem => problem.Kind == IssueKind.ScanFailure))
-        {
-            EditorUtility.DisplayDialog(
-                "无法生成替换 Prefab",
-                "本次扫描失败，不能使用不完整的扫描结果执行替换。请重新扫描并确认没有扫描错误后再试。",
-                "确定");
-            return;
-        }
-
-        var issues = BuildReviewIssues();
-        lastReviewIssueCount = issues.Count;
-        var actionableIssues = issues
-            .Where(issue => !string.IsNullOrEmpty(issue.SlotKey))
-            .ToList();
-
-        if (actionableIssues.Count > 0)
-        {
-            IssueReviewWindow.Show(actionableIssues, (acknowledged, selectedIssueSlots) =>
-            {
-                if (acknowledged)
-                {
-                    ConfirmAndApply(selectedIssueSlots);
-                }
-            });
-        }
-        else
-        {
-            ConfirmAndApply(new HashSet<string>(StringComparer.Ordinal));
-        }
-    }
-
-    private void ConfirmAndApply(HashSet<string> selectedIssueSlots)
-    {
-        if (saveMode == SaveMode.ModifyOriginal
-            && !EditorUtility.DisplayDialog(
-                "确认修改当前 Prefab",
-                "这会直接覆盖当前 Prefab 文件，原文件不会保留为独立副本。确定继续吗？",
-                "覆盖并执行",
-                "取消"))
-        {
-            return;
-        }
-
-        PerformApply(selectedIssueSlots);
-    }
-
-    private List<ReviewIssue> BuildReviewIssues()
-    {
-        var issues = new List<ReviewIssue>();
-        foreach (var problem in scanProblems)
-        {
-            issues.Add(new ReviewIssue(problem.Kind, problem.Path, problem.Message));
-        }
-
-        foreach (var slot in slots.Where(s => s.Replacement != null))
-        {
-            if (slot.HasResolutionMismatch)
-            {
-                issues.Add(new ReviewIssue(
-                    IssueKind.ResolutionMismatch,
-                    slot.DisplayName,
-                    string.Format(
-                        "原图分辨率 {0}，槽位图分辨率 {1}（分辨率不一致，请确认后继续）",
-                        slot.OriginalResolutionText,
-                        slot.ReplacementResolutionText),
-                    slot.Key));
-            }
-
-            var readOnlyUsages = slot.Usages.Where(u => !u.Writable).ToList();
-            if (readOnlyUsages.Count > 0)
-            {
-                issues.Add(new ReviewIssue(
-                    IssueKind.NestedPrefabReadOnly,
-                    slot.DisplayName,
-                    string.Format(
-                        "有 {0} 个引用位于嵌套 Prefab，无法直接写回（这些引用将跳过）：{1}",
-                        readOnlyUsages.Count,
-                        string.Join("、", readOnlyUsages.Select(u => u.Path).ToArray())),
-                    slot.Key));
-            }
-        }
-
-        return issues;
-    }
-
-    private void DrawProblemDetails(List<ReviewIssue> issues)
-    {
-        problemDetailsExpanded = EditorGUILayout.Foldout(
-            problemDetailsExpanded,
-            string.Format("问题明细（{0}）", issues.Count),
-            true);
-        if (!problemDetailsExpanded)
-        {
-            return;
-        }
-
-        var height = Mathf.Min(220f, Mathf.Max(64f, issues.Count * 34f));
-        problemScrollPosition = EditorGUILayout.BeginScrollView(
-            problemScrollPosition,
-            EditorStyles.helpBox,
-            GUILayout.Height(height));
-        foreach (var issue in issues)
-        {
-            EditorGUILayout.LabelField(
-                string.Format("[{0}] {1}\n{2}", GetIssueKindLabel(issue.Kind), issue.Path, issue.Message),
-                EditorStyles.wordWrappedMiniLabel);
-            GUILayout.Space(4f);
-        }
-
-        EditorGUILayout.EndScrollView();
-    }
-
-    private string BuildIssueSummary(List<ReviewIssue> issues)
-    {
-        return string.Format(
-            "当前共 {0} 个问题项（已配置替换图槽位）：Image 空/丢失 {1}，RawImage 空/丢失 {2}，分辨率不一致 {3}，嵌套只读槽位 {4}，扫描失败 {5}。未配置替换图 {6} 个，将自动跳过。",
-            issues.Count,
-            CountIssues(issues, IssueKind.ImageMissingReference),
-            CountIssues(issues, IssueKind.RawImageMissingReference),
-            CountIssues(issues, IssueKind.ResolutionMismatch),
-            CountIssues(issues, IssueKind.NestedPrefabReadOnly),
-            CountIssues(issues, IssueKind.ScanFailure),
-            GetUnconfiguredSlotCount());
-    }
-
-    private int GetUnconfiguredSlotCount()
-    {
-        return slots.Count(slot => slot.Replacement == null);
-    }
-
-    private static int CountIssues(List<ReviewIssue> issues, IssueKind kind)
-    {
-        return issues.Count(issue => issue.Kind == kind);
-    }
-
-    private static string GetIssueKindLabel(IssueKind kind)
-    {
-        switch (kind)
-        {
-            case IssueKind.ImageMissingReference:
-                return "Image 空/丢失";
-            case IssueKind.RawImageMissingReference:
-                return "RawImage 空/丢失";
-            case IssueKind.MissingReplacement:
-                return "未配置槽位";
-            case IssueKind.ResolutionMismatch:
-                return "分辨率不一致";
-            case IssueKind.NestedPrefabReadOnly:
-                return "嵌套只读";
-            case IssueKind.ScanFailure:
-                return "扫描失败";
-            default:
-                return "其它";
-        }
-    }
-
-    private void PerformApply(HashSet<string> selectedIssueSlots)
-    {
-        if (isBusy)
-        {
-            return;
-        }
-
-        var prefabPath = AssetDatabase.GetAssetPath(prefab);
-        if (string.IsNullOrEmpty(prefabPath))
-        {
-            return;
-        }
-
-        var skippedIssueSlots = new HashSet<string>(
-            BuildReviewIssues()
-                .Where(issue => !string.IsNullOrEmpty(issue.SlotKey))
-                .Select(issue => issue.SlotKey)
-                .Where(slotKey => selectedIssueSlots == null || !selectedIssueSlots.Contains(slotKey)),
-            StringComparer.Ordinal);
-        var replacementByKey = slots
-            .Where(s => s.Replacement != null && !skippedIssueSlots.Contains(s.Key))
-            .ToDictionary(s => s.Key, s => s.Replacement, StringComparer.Ordinal);
-
-        isBusy = true;
-        PrefabOperationContext context = null;
-        try
-        {
-            context = PrefabOperationContext.Open(prefab, prefabPath);
-            var root = context.Root;
-            var replacedSlots = new HashSet<string>(StringComparer.Ordinal);
-            var replacedNodes = 0;
-
-            foreach (var image in root.GetComponentsInChildren<Image>(true))
-            {
-                var original = image.sprite;
-                Sprite replacement;
-                if (original == null || !replacementByKey.TryGetValue(GetAssetKey(original), out replacement)
-                    || replacement == null || !IsDirectlyWritable(image.gameObject, root))
-                {
-                    continue;
-                }
-
-                image.sprite = replacement;
-                EditorUtility.SetDirty(image);
-                replacedSlots.Add(GetAssetKey(original));
-                replacedNodes++;
-            }
-
-            foreach (var rawImage in root.GetComponentsInChildren<RawImage>(true))
-            {
-                var original = rawImage.texture;
-                Sprite replacement;
-                if (original == null || !replacementByKey.TryGetValue(GetAssetKey(original), out replacement)
-                    || replacement == null || replacement.texture == null
-                    || !IsDirectlyWritable(rawImage.gameObject, root))
-                {
-                    continue;
-                }
-
-                rawImage.texture = replacement.texture;
-                EditorUtility.SetDirty(rawImage);
-                replacedSlots.Add(GetAssetKey(original));
-                replacedNodes++;
-            }
-
-            if (replacedNodes == 0)
-            {
-                EditorUtility.DisplayDialog(
-                    "没有可替换的引用",
-                    "没有配置有效替换图，或确认窗口中未选择任何异常槽位，或所有引用都属于只读嵌套 Prefab。",
-                    "确定");
                 return;
             }
 
-            var outputPath = GetOutputPath(prefabPath);
-            bool saveSucceeded;
-            GameObject savedPrefab;
-            if (saveMode == SaveMode.ModifyOriginal
-                && PrefabUtility.GetPrefabAssetType(prefab) == PrefabAssetType.Variant)
+            hasSession = true;
+            serializedVersion = SessionVersion;
+            targetObject = data.Target == null ? null : data.Target.Resolve() as GameObject;
+            targetDisplayName = data.TargetDisplayName ?? string.Empty;
+            searchText = data.SearchText ?? string.Empty;
+            currentPage = data.CurrentPage;
+            slots = data.Slots == null
+                ? new List<ImageSlot>()
+                : data.Slots.Where(item => item != null)
+                    .Select(item => item.Restore(data.Version))
+                    .Where(slot => slot.OriginalSource != null)
+                    .ToList();
+            foreach (var slot in slots)
             {
-                PrefabUtility.ApplyPrefabInstance(root, InteractionMode.UserAction);
-                savedPrefab = prefab;
-                saveSucceeded = true;
+                var componentTransform = slot.Component == null ? null : slot.Component.transform;
+                if (targetObject == null
+                    || componentTransform == null
+                    || (componentTransform != targetObject.transform && !componentTransform.IsChildOf(targetObject.transform)))
+                {
+                    slot.Component = null;
+                }
             }
-            else
-            {
-                savedPrefab = PrefabUtility.SaveAsPrefabAsset(root, outputPath, out saveSucceeded);
-            }
-            if (!saveSucceeded || savedPrefab == null)
-            {
-                EditorUtility.DisplayDialog("生成失败", "Unity 未能保存新 Prefab。请检查输出路径和资源状态。", "确定");
-                return;
-            }
-
-            AssetDatabase.SaveAssets();
-            AssetDatabase.Refresh();
-            Selection.activeObject = savedPrefab;
-            EditorGUIUtility.PingObject(savedPrefab);
-            EditorUtility.DisplayDialog(
-                saveMode == SaveMode.ModifyOriginal ? "修改完成" : "生成完成",
-                string.Format("{0}：{1}\n替换槽位：{2}\n受影响节点：{3}\n问题项：{4}",
-                    saveMode == SaveMode.ModifyOriginal ? "目标" : "输出",
-                    outputPath,
-                    replacedSlots.Count,
-                    replacedNodes,
-                    lastReviewIssueCount),
-                "确定");
         }
         catch (Exception exception)
         {
-            Debug.LogException(exception);
-            EditorUtility.DisplayDialog("生成失败", exception.Message, "确定");
+            Debug.LogWarning("Prefab Image Replacer 无法恢复上次会话：" + exception.Message);
+            ClearSession();
         }
-        finally
-        {
-            if (context != null)
-            {
-                context.Dispose();
-            }
-
-            isBusy = false;
-            ScanPrefab();
-        }
-    }
-
-    private static bool IsDirectlyWritable(GameObject gameObject, GameObject prefabRoot)
-    {
-        if (gameObject == null)
-        {
-            return false;
-        }
-
-        var nearestInstanceRoot = PrefabUtility.GetNearestPrefabInstanceRoot(gameObject);
-        if (nearestInstanceRoot == null)
-        {
-            return true;
-        }
-
-        return nearestInstanceRoot == prefabRoot;
     }
 
     private static string BuildTransformPath(Transform transform, Transform root)
@@ -822,507 +1578,344 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         return string.Join("/", names.ToArray());
     }
 
-    private static string GetAssetKey(UnityEngine.Object source)
+    private static Vector2Int GetResolution(UnityEngine.Object source, SlotKind kind)
     {
         if (source == null)
         {
-            return "<missing>";
+            return Vector2Int.zero;
         }
 
-        string guid;
-        long localId;
-        if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(source, out guid, out localId))
+        var sprite = source as Sprite;
+        if (sprite != null)
         {
-            return guid + ":" + localId;
-        }
-
-        try
-        {
-            var globalId = GlobalObjectId.GetGlobalObjectIdSlow(source);
-            if (globalId.identifierType != 0)
+            if (kind == SlotKind.Image)
             {
-                return "global:" + globalId;
+                return new Vector2Int(Mathf.RoundToInt(sprite.rect.width), Mathf.RoundToInt(sprite.rect.height));
             }
-        }
-        catch (Exception)
-        {
-            // Some built-in objects do not expose a GlobalObjectId.
+
+            return sprite.texture == null
+                ? Vector2Int.zero
+                : new Vector2Int(sprite.texture.width, sprite.texture.height);
         }
 
-        var path = AssetDatabase.GetAssetPath(source);
-        return path + "#" + source.GetInstanceID();
+        var texture = source as Texture;
+        return texture == null ? Vector2Int.zero : new Vector2Int(texture.width, texture.height);
     }
 
-    private static string GetNextOutputPath(string sourcePath)
+    private static string FormatResolution(Vector2Int resolution)
     {
-        var directory = Path.GetDirectoryName(sourcePath);
-        if (string.IsNullOrEmpty(directory))
-        {
-            directory = "Assets";
-        }
-
-        directory = directory.Replace('\\', '/');
-        var sourceName = Path.GetFileNameWithoutExtension(sourcePath);
-        var candidate = string.Format("{0}/{1}{2}.prefab", directory, sourceName, OutputSuffix);
-        var index = 1;
-        while (File.Exists(candidate))
-        {
-            candidate = string.Format("{0}/{1}{2}_{3:00}.prefab", directory, sourceName, OutputSuffix, index++);
-        }
-
-        return candidate;
-    }
-
-    private string GetOutputPath(string sourcePath)
-    {
-        return saveMode == SaveMode.ModifyOriginal
-            ? sourcePath
-            : GetNextOutputPath(sourcePath);
-    }
-
-    private sealed class PrefabOperationContext : IDisposable
-    {
-        public readonly GameObject Root;
-        private readonly Scene scene;
-        private readonly Scene previousActiveScene;
-        private readonly bool isIsolatedContents;
-
-        private PrefabOperationContext(
-            GameObject root,
-            Scene scene,
-            Scene previousActiveScene,
-            bool isIsolatedContents)
-        {
-            Root = root;
-            this.scene = scene;
-            this.previousActiveScene = previousActiveScene;
-            this.isIsolatedContents = isIsolatedContents;
-        }
-
-        public static PrefabOperationContext Open(GameObject prefabAsset, string assetPath)
-        {
-            if (PrefabUtility.GetPrefabAssetType(prefabAsset) == PrefabAssetType.Variant)
-            {
-                var previousActiveScene = SceneManager.GetActiveScene();
-                var tempScene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
-                var instance = PrefabUtility.InstantiatePrefab(prefabAsset, tempScene) as GameObject;
-                if (instance == null)
-                {
-                    EditorSceneManager.CloseScene(tempScene, true);
-                    throw new InvalidOperationException("无法实例化 Prefab Variant。");
-                }
-
-                return new PrefabOperationContext(instance, tempScene, previousActiveScene, false);
-            }
-
-            return new PrefabOperationContext(
-                PrefabUtility.LoadPrefabContents(assetPath),
-                default(Scene),
-                default(Scene),
-                true);
-        }
-
-        public void Dispose()
-        {
-            if (isIsolatedContents)
-            {
-                if (Root != null)
-                {
-                    PrefabUtility.UnloadPrefabContents(Root);
-                }
-
-                return;
-            }
-
-            if (Root != null)
-            {
-                UnityEngine.Object.DestroyImmediate(Root);
-            }
-
-            if (scene.IsValid())
-            {
-                EditorSceneManager.CloseScene(scene, true);
-            }
-
-            if (previousActiveScene.IsValid())
-            {
-                SceneManager.SetActiveScene(previousActiveScene);
-            }
-        }
+        return resolution == Vector2Int.zero
+            ? "未知"
+            : string.Format("{0} x {1}", resolution.x, resolution.y);
     }
 
     private enum SaveMode
     {
-        CreateCopy,
-        ModifyOriginal
+        CreateNew,
+        ModifySource
     }
 
-    private enum SourceKind
+    private enum SlotKind
     {
-        Sprite,
-        Texture
+        Image,
+        RawImage
     }
 
-    private enum IssueKind
-    {
-        ImageMissingReference,
-        RawImageMissingReference,
-        MissingReplacement,
-        ResolutionMismatch,
-        NestedPrefabReadOnly,
-        ScanFailure
-    }
-
+    [Serializable]
     private sealed class ImageSlot
     {
-        public readonly string Key;
-        public readonly UnityEngine.Object Source;
-        public readonly SourceKind SourceKind;
-        public readonly List<ImageUsage> Usages = new List<ImageUsage>();
+        public Component Component;
+        public SlotKind Kind;
+        public string Path;
+        public UnityEngine.Object OriginalSource;
+        public RectTransformSnapshot OriginalRect;
+        public List<TransformLocatorStep> Locator = new List<TransformLocatorStep>();
+        public int ComponentIndex;
         public Sprite Replacement;
-        public bool UsagesExpanded;
+        public bool IsReplacementApplied;
+        public bool UseNativeSize;
+        public bool GroupExpanded;
+        public string Warning;
 
-        public ImageSlot(string key, UnityEngine.Object source, SourceKind sourceKind)
+        public bool IsValid
         {
-            Key = key;
-            Source = source;
-            SourceKind = sourceKind;
+            get
+            {
+                return Component != null
+                    && RectTransform != null
+                    && ((Kind == SlotKind.Image && Component is Image)
+                        || (Kind == SlotKind.RawImage && Component is RawImage));
+            }
         }
 
-        public string DisplayName { get { return Source == null ? "<missing>" : Source.name; } }
+        public RectTransform RectTransform
+        {
+            get { return Component == null ? null : Component.transform as RectTransform; }
+        }
+
+        public bool HasAppliedReplacement
+        {
+            get { return IsValid && IsReplacementApplied && Replacement != null; }
+        }
+
+        public string ComponentLabel
+        {
+            get { return Kind == SlotKind.Image ? "Image" : "RawImage"; }
+        }
+
+    }
+
+    private sealed class ImageGroup
+    {
+        public readonly UnityEngine.Object OriginalSource;
+        public readonly List<ImageSlot> Slots = new List<ImageSlot>();
+
+        public ImageGroup(UnityEngine.Object originalSource)
+        {
+            OriginalSource = originalSource;
+        }
+
+        public string OriginalName
+        {
+            get { return OriginalSource == null ? "<未设置>" : OriginalSource.name; }
+        }
 
         public string SourcePath
         {
             get
             {
-                var path = Source == null ? string.Empty : AssetDatabase.GetAssetPath(Source);
+                var path = AssetDatabase.GetAssetPath(OriginalSource);
                 return string.IsNullOrEmpty(path) ? "（非项目资源）" : path;
             }
         }
 
+        public Sprite Replacement
+        {
+            get { return Slots.Select(slot => slot.Replacement).FirstOrDefault(item => item != null); }
+        }
+
+        public int AppliedCount
+        {
+            get { return Slots.Count(slot => slot.HasAppliedReplacement); }
+        }
+
+        public bool IsExpanded
+        {
+            get { return Slots.Any(slot => slot.GroupExpanded); }
+        }
+
         public string OriginalResolutionText
         {
-            get { return FormatResolution(GetResolution(Source, SourceKind == SourceKind.Sprite)); }
+            get
+            {
+                var kind = Slots.Count == 0 ? SlotKind.Image : Slots[0].Kind;
+                return FormatResolution(GetResolution(OriginalSource, kind));
+            }
         }
 
         public string ReplacementResolutionText
         {
             get
             {
-                if (Replacement == null)
-                {
-                    return "未配置";
-                }
-
-                return FormatResolution(GetResolution(Replacement, SourceKind == SourceKind.Sprite));
+                var replacement = Replacement;
+                var kind = Slots.Count == 0 ? SlotKind.Image : Slots[0].Kind;
+                return replacement == null ? "未配置" : FormatResolution(GetResolution(replacement, kind));
             }
         }
 
-        public bool HasResolutionMismatch
+        public IEnumerable<string> Warnings
         {
             get
             {
-                if (Replacement == null)
-                {
-                    return false;
-                }
-
-                return GetResolution(Source, SourceKind == SourceKind.Sprite) != GetResolution(
-                    Replacement,
-                    SourceKind == SourceKind.Sprite);
+                return Slots.Select(slot => slot.Warning)
+                    .Where(warning => !string.IsNullOrEmpty(warning))
+                    .Distinct();
             }
-        }
-
-        private static Vector2Int GetResolution(UnityEngine.Object source, bool useSpriteRegion)
-        {
-            if (source == null)
-            {
-                return Vector2Int.zero;
-            }
-
-            if (useSpriteRegion)
-            {
-                var sprite = source as Sprite;
-                if (sprite != null)
-                {
-                    return new Vector2Int(
-                        Mathf.RoundToInt(sprite.rect.width),
-                        Mathf.RoundToInt(sprite.rect.height));
-                }
-            }
-
-            var sourceSprite = source as Sprite;
-            if (sourceSprite != null)
-            {
-                var spriteTexture = sourceSprite.texture;
-                return spriteTexture == null
-                    ? Vector2Int.zero
-                    : new Vector2Int(spriteTexture.width, spriteTexture.height);
-            }
-
-            var texture = source as Texture;
-            return texture == null ? Vector2Int.zero : new Vector2Int(texture.width, texture.height);
-        }
-
-        private static string FormatResolution(Vector2Int resolution)
-        {
-            return resolution == Vector2Int.zero
-                ? "未知"
-                : string.Format("{0} x {1}", resolution.x, resolution.y);
         }
     }
 
-    private sealed class ImageUsage
+    private sealed class ImageGroupView
     {
-        public readonly string Path;
-        public readonly string ComponentProperty;
-        public readonly bool Writable;
+        public readonly ImageGroup Group;
+        public readonly List<ImageSlot> VisibleSlots;
+        public readonly bool ForceExpanded;
 
-        public ImageUsage(string path, string componentProperty, bool writable)
+        public ImageGroupView(ImageGroup group, IEnumerable<ImageSlot> visibleSlots, bool forceExpanded)
         {
-            Path = path;
-            ComponentProperty = componentProperty;
-            Writable = writable;
+            Group = group;
+            VisibleSlots = visibleSlots.ToList();
+            ForceExpanded = forceExpanded;
         }
     }
 
-    private sealed class ScanProblem
+    [Serializable]
+    private sealed class RectTransformSnapshot
     {
-        public readonly IssueKind Kind;
-        public readonly string Path;
-        public readonly string Message;
+        public Vector2 AnchorMin;
+        public Vector2 AnchorMax;
+        public Vector2 Pivot;
+        public Vector3 AnchoredPosition3D;
+        public Vector2 SizeDelta;
+        public Quaternion LocalRotation;
+        public Vector3 LocalScale;
 
-        public ScanProblem(IssueKind kind, string path, string message)
+        public static RectTransformSnapshot Capture(RectTransform rectTransform)
         {
-            Kind = kind;
-            Path = path;
-            Message = message;
-        }
-    }
-
-    private sealed class ReviewIssue
-    {
-        public readonly IssueKind Kind;
-        public readonly string Path;
-        public readonly string Message;
-        public readonly string SlotKey;
-
-        public ReviewIssue(IssueKind kind, string path, string message, string slotKey = null)
-        {
-            Kind = kind;
-            Path = path;
-            Message = message;
-            SlotKey = slotKey;
-        }
-    }
-
-    private sealed class IssueReviewWindow : EditorWindow
-    {
-        private static Action<bool, HashSet<string>> completion;
-        private List<IssueGroup> groups;
-        private Vector2 scroll;
-        private int selectionAnchor = -1;
-        private bool isFinishing;
-
-        public static void Show(List<ReviewIssue> reviewIssues, Action<bool, HashSet<string>> onComplete)
-        {
-            var window = CreateInstance<IssueReviewWindow>();
-            window.groups = reviewIssues
-                .Where(issue => !string.IsNullOrEmpty(issue.SlotKey))
-                .GroupBy(issue => issue.SlotKey, StringComparer.Ordinal)
-                .Select(group => new IssueGroup(
-                    group.Key,
-                    group.First().Path,
-                    string.Join(
-                        "\n",
-                        group.Select(issue => "[" + GetIssueKindLabel(issue.Kind) + "] " + issue.Message).ToArray())))
-                .ToList();
-            completion = onComplete;
-            window.titleContent = new GUIContent("确认问题槽位");
-            window.minSize = new Vector2(520f, 320f);
-            window.ShowModalUtility();
+            return new RectTransformSnapshot
+            {
+                AnchorMin = rectTransform.anchorMin,
+                AnchorMax = rectTransform.anchorMax,
+                Pivot = rectTransform.pivot,
+                AnchoredPosition3D = rectTransform.anchoredPosition3D,
+                SizeDelta = rectTransform.sizeDelta,
+                LocalRotation = rectTransform.localRotation,
+                LocalScale = rectTransform.localScale
+            };
         }
 
-        private void OnGUI()
+        public void Apply(RectTransform rectTransform)
         {
-            EditorGUILayout.LabelField("执行前确认问题槽位", EditorStyles.boldLabel);
-            EditorGUILayout.HelpBox(
-                string.Format(
-                    "发现 {0} 个异常槽位。点击选择，Shift 选择区间，Ctrl/Command 追加或取消单项；未选中的异常槽位会跳过。未配置替换图的槽位不会进入此列表。",
-                    groups.Count),
-                MessageType.Warning);
-
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                if (GUILayout.Button("全选", GUILayout.Width(80f)))
-                {
-                    foreach (var group in groups)
-                    {
-                        group.Acknowledged = true;
-                    }
-
-                    selectionAnchor = -1;
-                }
-
-                if (GUILayout.Button("全不选", GUILayout.Width(80f)))
-                {
-                    ClearSelection();
-                    selectionAnchor = -1;
-                }
-
-                GUILayout.Space(12f);
-                EditorGUILayout.LabelField(
-                    string.Format("已选择 {0}/{1}", groups.Count(group => group.Acknowledged), groups.Count),
-                    EditorStyles.miniLabel);
-            }
-
-            scroll = EditorGUILayout.BeginScrollView(scroll);
-            for (var index = 0; index < groups.Count; index++)
-            {
-                DrawIssueGroup(groups[index], index);
-                GUILayout.Space(5f);
-            }
-
-            EditorGUILayout.EndScrollView();
-            GUILayout.FlexibleSpace();
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                GUILayout.FlexibleSpace();
-                if (GUILayout.Button("取消", GUILayout.Width(90f)))
-                {
-                    Finish(false);
-                }
-
-                if (GUILayout.Button("确认并继续", GUILayout.Width(110f)))
-                {
-                    Finish(true);
-                }
-            }
-        }
-
-        private void DrawIssueGroup(IssueGroup group, int index)
-        {
-            var fullText = group.Path + "\n" + group.Message;
-            var content = new GUIContent(fullText, fullText);
-            var availableWidth = Mathf.Max(160f, position.width - 72f);
-            var textHeight = EditorStyles.wordWrappedLabel.CalcHeight(content, availableWidth);
-            var rowHeight = Mathf.Max(28f, textHeight + 10f);
-            var rowRect = GUILayoutUtility.GetRect(
-                GUIContent.none,
-                GUIStyle.none,
-                GUILayout.Height(rowHeight),
-                GUILayout.ExpandWidth(true));
-
-            if (Event.current.type == EventType.Repaint && group.Acknowledged)
-            {
-                EditorGUI.DrawRect(rowRect, new Color(0.24f, 0.38f, 0.56f, 0.45f));
-            }
-
-            var toggleRect = new Rect(rowRect.x + 5f, rowRect.y + 5f, 18f, 18f);
-            var textRect = new Rect(
-                rowRect.x + 28f,
-                rowRect.y + 4f,
-                Mathf.Max(100f, rowRect.width - 33f),
-                rowRect.height - 8f);
-            GUI.Label(textRect, content, EditorStyles.wordWrappedLabel);
-            if (Event.current.type == EventType.Repaint)
-            {
-                EditorStyles.toggle.Draw(toggleRect, GUIContent.none, false, false, group.Acknowledged, false);
-            }
-
-            if (GUI.Button(rowRect, GUIContent.none, GUIStyle.none))
-            {
-                ApplySelection(index, Event.current.shift, Event.current.control || Event.current.command);
-            }
-        }
-
-        private void ApplySelection(int index, bool range, bool additive)
-        {
-            if (range && selectionAnchor >= 0)
-            {
-                var start = Mathf.Min(selectionAnchor, index);
-                var end = Mathf.Max(selectionAnchor, index);
-                if (!additive)
-                {
-                    ClearSelection();
-                }
-
-                for (var rangeIndex = start; rangeIndex <= end; rangeIndex++)
-                {
-                    groups[rangeIndex].Acknowledged = true;
-                }
-            }
-            else if (additive)
-            {
-                groups[index].Acknowledged = !groups[index].Acknowledged;
-                selectionAnchor = index;
-            }
-            else
-            {
-                ClearSelection();
-                groups[index].Acknowledged = true;
-                selectionAnchor = index;
-            }
-
-            Repaint();
-        }
-
-        private void ClearSelection()
-        {
-            foreach (var group in groups)
-            {
-                group.Acknowledged = false;
-            }
-        }
-
-        private void Finish(bool accepted)
-        {
-            if (isFinishing)
+            if (rectTransform == null)
             {
                 return;
             }
 
-            isFinishing = true;
-            var callback = completion;
-            completion = null;
-            var selectedIssueSlots = accepted
-                ? new HashSet<string>(
-                    groups.Where(group => group.Acknowledged).Select(group => group.SlotKey),
-                    StringComparer.Ordinal)
-                : new HashSet<string>(StringComparer.Ordinal);
+            rectTransform.anchorMin = AnchorMin;
+            rectTransform.anchorMax = AnchorMax;
+            rectTransform.pivot = Pivot;
+            rectTransform.anchoredPosition3D = AnchoredPosition3D;
+            rectTransform.sizeDelta = SizeDelta;
+            rectTransform.localRotation = LocalRotation;
+            rectTransform.localScale = LocalScale;
+        }
+    }
 
-            EditorApplication.delayCall += () =>
+    [Serializable]
+    private sealed class TransformLocatorStep
+    {
+        public string Name;
+        public int SameNameIndex;
+    }
+
+    [Serializable]
+    private sealed class ObjectReferenceData
+    {
+        public string GlobalId;
+        public int InstanceId;
+
+        public static ObjectReferenceData Capture(UnityEngine.Object source)
+        {
+            var data = new ObjectReferenceData();
+            if (source == null)
             {
-                if (callback != null)
+                return data;
+            }
+
+            data.InstanceId = source.GetInstanceID();
+            try
+            {
+                var globalId = GlobalObjectId.GetGlobalObjectIdSlow(source);
+                if (globalId.identifierType != 0)
                 {
-                    callback(accepted, selectedIssueSlots);
+                    data.GlobalId = globalId.ToString();
                 }
+            }
+            catch (Exception)
+            {
+                // Some temporary scene objects only have an Editor instance ID.
+            }
+
+            return data;
+        }
+
+        public UnityEngine.Object Resolve()
+        {
+            GlobalObjectId globalId;
+            if (!string.IsNullOrEmpty(GlobalId) && GlobalObjectId.TryParse(GlobalId, out globalId))
+            {
+                var globalObject = GlobalObjectId.GlobalObjectIdentifierToObjectSlow(globalId);
+                if (globalObject != null)
+                {
+                    return globalObject;
+                }
+            }
+
+            if (InstanceId != 0)
+            {
+                return EditorUtility.InstanceIDToObject(InstanceId);
+            }
+
+            return null;
+        }
+    }
+
+    [Serializable]
+    private sealed class SessionData
+    {
+        public int Version;
+        public bool HasSession;
+        public ObjectReferenceData Target;
+        public string TargetDisplayName;
+        public string SearchText;
+        public int CurrentPage;
+        public List<PersistedSlotData> Slots;
+    }
+
+    [Serializable]
+    private sealed class PersistedSlotData
+    {
+        public ObjectReferenceData Component;
+        public SlotKind Kind;
+        public string Path;
+        public ObjectReferenceData OriginalSource;
+        public RectTransformSnapshot OriginalRect;
+        public List<TransformLocatorStep> Locator;
+        public int ComponentIndex;
+        public ObjectReferenceData Replacement;
+        public bool IsReplacementApplied;
+        public bool UseNativeSize;
+        public bool GroupExpanded;
+        public string Warning;
+
+        public static PersistedSlotData Capture(ImageSlot slot)
+        {
+            return new PersistedSlotData
+            {
+                Component = ObjectReferenceData.Capture(slot.Component),
+                Kind = slot.Kind,
+                Path = slot.Path,
+                OriginalSource = ObjectReferenceData.Capture(slot.OriginalSource),
+                OriginalRect = slot.OriginalRect,
+                Locator = slot.Locator,
+                ComponentIndex = slot.ComponentIndex,
+                Replacement = ObjectReferenceData.Capture(slot.Replacement),
+                IsReplacementApplied = slot.IsReplacementApplied,
+                UseNativeSize = slot.UseNativeSize,
+                GroupExpanded = slot.GroupExpanded,
+                Warning = slot.Warning
             };
-            Close();
-            GUIUtility.ExitGUI();
         }
 
-        private void OnDestroy()
+        public ImageSlot Restore(int sessionVersion)
         {
-            if (!isFinishing)
+            var replacement = Replacement == null ? null : Replacement.Resolve() as Sprite;
+            var isReplacementApplied = replacement != null
+                && (sessionVersion >= AppliedStateVersion ? IsReplacementApplied : true);
+            return new ImageSlot
             {
-                completion = null;
-            }
-        }
-
-        private sealed class IssueGroup
-        {
-            public readonly string SlotKey;
-            public readonly string Path;
-            public readonly string Message;
-            public bool Acknowledged;
-
-            public IssueGroup(string slotKey, string path, string message)
-            {
-                SlotKey = slotKey;
-                Path = path;
-                Message = message;
-            }
+                Component = Component == null ? null : Component.Resolve() as UnityEngine.Component,
+                Kind = Kind,
+                Path = Path,
+                OriginalSource = OriginalSource == null ? null : OriginalSource.Resolve(),
+                OriginalRect = OriginalRect ?? new RectTransformSnapshot(),
+                Locator = Locator ?? new List<TransformLocatorStep>(),
+                ComponentIndex = ComponentIndex,
+                Replacement = replacement,
+                IsReplacementApplied = isReplacementApplied,
+                UseNativeSize = isReplacementApplied && UseNativeSize,
+                GroupExpanded = GroupExpanded,
+                Warning = Warning ?? string.Empty
+            };
         }
     }
 }
