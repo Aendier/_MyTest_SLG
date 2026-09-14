@@ -14,7 +14,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     private const string SessionKey = "PrefabImageReplacerWindow.Session";
     private const string OutputSuffix = "_Replaced";
     private const int AppliedStateVersion = 2;
-    private const int SessionVersion = 2;
+    private const int SessionVersion = 4;
     private const int PageSize = 30;
     private const float PreviewSize = 44f;
     private const float NativeSizeWarningThreshold = 0.5f;
@@ -29,9 +29,18 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     [SerializeField] private bool hasSession;
     [SerializeField] private bool isSaveQueued;
     [SerializeField] private int serializedVersion;
+    [SerializeField] private bool skippedPrefabsExpanded;
+    [SerializeField] private bool hasIgnoreListSnapshot;
+    [SerializeField] private string scannedIgnoreListSignature = string.Empty;
+    [SerializeField] private int skippedPrefabInstanceCount;
+    [SerializeField] private List<SkippedPrefabSummary> skippedPrefabs = new List<SkippedPrefabSummary>();
+    [SerializeField] private List<string> scanWarnings = new List<string>();
 
     [NonSerialized] private GUIStyle pathButtonStyle;
     [NonSerialized] private bool isRestoreQueued;
+    [NonSerialized] private bool isScanning;
+    [NonSerialized] private PrefabImageReplacerIgnoreListConfig ignoreListConfig;
+    [NonSerialized] private string ignoreListConfigError = string.Empty;
 
     private GUIStyle PathButtonStyle
     {
@@ -59,9 +68,11 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
     private void OnEnable()
     {
+        var previousSerializedVersion = serializedVersion;
         minSize = new Vector2(640f, 420f);
         isSaveQueued = false;
         isRestoreQueued = false;
+        isScanning = false;
         Undo.undoRedoPerformed -= OnUndoRedoPerformed;
         Undo.undoRedoPerformed += OnUndoRedoPerformed;
         Selection.selectionChanged -= OnSelectionChanged;
@@ -75,6 +86,18 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         {
             slots = slots.Where(slot => slot != null).ToList();
         }
+
+        if (skippedPrefabs == null)
+        {
+            skippedPrefabs = new List<SkippedPrefabSummary>();
+        }
+
+        if (scanWarnings == null)
+        {
+            scanWarnings = new List<string>();
+        }
+
+        TryLoadIgnoreListConfig();
 
         if (serializedVersion < AppliedStateVersion)
         {
@@ -100,7 +123,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
         serializedVersion = SessionVersion;
 
-        if (!hasSession)
+        if (!hasSession || previousSerializedVersion < SessionVersion)
         {
             RestoreSession();
         }
@@ -110,11 +133,19 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     {
         Undo.undoRedoPerformed -= OnUndoRedoPerformed;
         Selection.selectionChanged -= OnSelectionChanged;
+        if (ignoreListConfig != null)
+        {
+            AssetDatabase.SaveAssetIfDirty(ignoreListConfig);
+        }
         PersistSession();
     }
 
     private void OnUndoRedoPerformed()
     {
+        if (ignoreListConfig != null)
+        {
+            AssetDatabase.SaveAssetIfDirty(ignoreListConfig);
+        }
         PersistSession();
         Repaint();
     }
@@ -137,7 +168,14 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             EditorGUILayout.HelpBox("实时替换仅支持编辑模式。退出播放模式后再操作。", MessageType.Warning);
         }
 
-        using (new EditorGUI.DisabledScope(editingDisabled))
+        DrawIgnoreListControls(editingDisabled || isScanning);
+
+        if (isScanning)
+        {
+            EditorGUILayout.HelpBox("正在扫描，请稍候。", MessageType.Info);
+        }
+
+        using (new EditorGUI.DisabledScope(editingDisabled || isScanning))
         {
             DrawTargetField();
             DrawToolbar();
@@ -168,8 +206,49 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 MessageType.Warning);
         }
 
-        DrawSlotList(editingDisabled);
-        DrawSaveControls(editingDisabled);
+        DrawSlotList(editingDisabled || isScanning);
+        DrawSaveControls(editingDisabled || isScanning);
+    }
+
+    private void TryLoadIgnoreListConfig()
+    {
+        try
+        {
+            ignoreListConfig = PrefabImageReplacerIgnoreListConfig.LoadOrCreate();
+            ignoreListConfigError = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            ignoreListConfig = null;
+            ignoreListConfigError = "忽略列表配置不可用：" + exception.Message;
+        }
+    }
+
+    private void DrawIgnoreListControls(bool controlsDisabled)
+    {
+        using (new EditorGUILayout.HorizontalScope())
+        {
+            EditorGUILayout.LabelField("Prefab 忽略列表", EditorStyles.miniBoldLabel);
+            using (new EditorGUI.DisabledScope(controlsDisabled))
+            {
+                if (GUILayout.Button("打开忽略列表", GUILayout.Width(110f)))
+                {
+                    PrefabImageReplacerIgnoreListWindow.Open();
+                }
+            }
+        }
+
+        if (ignoreListConfig == null)
+        {
+            EditorGUILayout.HelpBox(ignoreListConfigError, MessageType.Error);
+            using (new EditorGUI.DisabledScope(controlsDisabled))
+            {
+                if (GUILayout.Button("重新加载忽略列表配置", GUILayout.Width(170f)))
+                {
+                    TryLoadIgnoreListConfig();
+                }
+            }
+        }
     }
 
     private void DrawTargetField()
@@ -188,6 +267,14 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         if (selected == null)
         {
             ClearSession();
+            return;
+        }
+
+        if (ignoreListConfig == null)
+        {
+            targetError = string.IsNullOrEmpty(ignoreListConfigError)
+                ? "忽略列表配置不可用，无法开始扫描。"
+                : ignoreListConfigError;
             return;
         }
 
@@ -225,7 +312,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 scrollPosition = Vector2.zero;
             }
 
-            using (new EditorGUI.DisabledScope(targetObject == null))
+            using (new EditorGUI.DisabledScope(targetObject == null || ignoreListConfig == null || isScanning))
             {
                 if (GUILayout.Button(
                     new GUIContent("重扫并建立基线", "把对象当前状态记录为新的还原基线"),
@@ -261,6 +348,42 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 invalidCount,
                 filteredGroups.Count),
             EditorStyles.miniBoldLabel);
+
+        if (!hasIgnoreListSnapshot)
+        {
+            EditorGUILayout.HelpBox("当前会话没有忽略列表扫描快照，请重新扫描以应用忽略列表。", MessageType.Warning);
+        }
+        else if (ignoreListConfig != null
+            && !string.Equals(CaptureIgnoreListSnapshot().Signature, scannedIgnoreListSignature, StringComparison.Ordinal))
+        {
+            EditorGUILayout.HelpBox("忽略列表已变化，重新扫描后生效；当前结果仍可继续操作。", MessageType.Warning);
+        }
+
+        EditorGUILayout.LabelField(
+            string.Format("忽略列表跳过：{0} 个实例 / {1} 个 Prefab 资源", skippedPrefabInstanceCount, skippedPrefabs.Count),
+            EditorStyles.miniLabel);
+        if (skippedPrefabs.Count > 0)
+        {
+            skippedPrefabsExpanded = EditorGUILayout.Foldout(
+                skippedPrefabsExpanded,
+                "查看跳过详情",
+                true,
+                EditorStyles.foldout);
+            if (skippedPrefabsExpanded)
+            {
+                foreach (var skippedPrefab in skippedPrefabs)
+                {
+                    EditorGUILayout.LabelField(
+                        string.Format("{0}（{1} 个实例）", skippedPrefab.Path, skippedPrefab.InstanceCount),
+                        EditorStyles.wordWrappedMiniLabel);
+                }
+            }
+        }
+
+        foreach (var warning in scanWarnings)
+        {
+            EditorGUILayout.HelpBox(warning, MessageType.Warning);
+        }
 
         var pageCount = Mathf.Max(1, Mathf.CeilToInt(filteredGroups.Count / (float)PageSize));
         currentPage = Mathf.Clamp(currentPage, 0, pageCount - 1);
@@ -893,8 +1016,16 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
     private void RebuildBaseline(bool preserveGroupExpansion)
     {
-        if (targetObject == null)
+        if (targetObject == null || isScanning)
         {
+            return;
+        }
+
+        if (ignoreListConfig == null)
+        {
+            targetError = string.IsNullOrEmpty(ignoreListConfigError)
+                ? "忽略列表配置不可用，无法扫描。"
+                : ignoreListConfigError;
             return;
         }
 
@@ -914,20 +1045,29 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             : new Dictionary<UnityEngine.Object, bool>();
         var newSlots = new List<ImageSlot>();
 
-        foreach (var image in targetObject.GetComponentsInChildren<Image>(true))
+        var ignoreListSnapshot = CaptureIgnoreListSnapshot();
+        var skippedByGuid = new Dictionary<string, SkippedPrefabSummary>(StringComparer.OrdinalIgnoreCase);
+        var warnings = new List<string>();
+        isScanning = true;
+        try
         {
-            if (image.sprite != null)
-            {
-                newSlots.Add(CreateSlot(image, SlotKind.Image, expandedBySource));
-            }
+            ScanTransform(
+                targetObject.transform,
+                targetObject.transform,
+                ignoreListSnapshot,
+                expandedBySource,
+                newSlots,
+                skippedByGuid,
+                warnings);
         }
-
-        foreach (var rawImage in targetObject.GetComponentsInChildren<RawImage>(true))
+        catch (Exception exception)
         {
-            if (rawImage.texture != null)
-            {
-                newSlots.Add(CreateSlot(rawImage, SlotKind.RawImage, expandedBySource));
-            }
+            targetError = "扫描失败，已保留上一次结果：" + exception.Message;
+            return;
+        }
+        finally
+        {
+            isScanning = false;
         }
 
         slots = newSlots
@@ -938,8 +1078,189 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         currentPage = 0;
         scrollPosition = Vector2.zero;
         hasSession = true;
+        hasIgnoreListSnapshot = true;
+        scannedIgnoreListSignature = ignoreListSnapshot.Signature;
+        skippedPrefabInstanceCount = skippedByGuid.Values.Sum(item => item.InstanceCount);
+        skippedPrefabs = skippedByGuid.Values
+            .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        scanWarnings = warnings.Distinct(StringComparer.Ordinal).ToList();
         PersistSession();
         Repaint();
+    }
+
+    private IgnoreListSnapshot CaptureIgnoreListSnapshot()
+    {
+        var exactPrefabGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var folderPaths = new List<string>();
+        var signatureParts = new List<string>();
+
+        AddIgnoreListEntries(
+            ignoreListConfig.IgnoredPrefabs,
+            false,
+            exactPrefabGuids,
+            folderPaths,
+            signatureParts);
+        AddIgnoreListEntries(
+            ignoreListConfig.IgnoredFolders,
+            true,
+            exactPrefabGuids,
+            folderPaths,
+            signatureParts);
+
+        signatureParts.Sort(StringComparer.Ordinal);
+        return new IgnoreListSnapshot
+        {
+            ExactPrefabGuids = exactPrefabGuids,
+            FolderPaths = folderPaths
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
+            Signature = string.Join("|", signatureParts)
+        };
+    }
+
+    private static void AddIgnoreListEntries(
+        IList<PrefabImageReplacerIgnoreEntry> entries,
+        bool isFolder,
+        HashSet<string> exactPrefabGuids,
+        List<string> folderPaths,
+        List<string> signatureParts)
+    {
+        if (entries == null)
+        {
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry == null)
+            {
+                signatureParts.Add((isFolder ? "F" : "P") + ":<null>");
+                continue;
+            }
+
+            var guid = entry.Guid ?? string.Empty;
+            var resolvedPath = string.IsNullOrEmpty(guid)
+                ? string.Empty
+                : AssetDatabase.GUIDToAssetPath(guid);
+            resolvedPath = string.IsNullOrEmpty(resolvedPath)
+                ? string.Empty
+                : resolvedPath.Replace('\\', '/');
+            var valid = isFolder
+                ? AssetDatabase.IsValidFolder(resolvedPath)
+                : resolvedPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)
+                    && AssetDatabase.LoadAssetAtPath<GameObject>(resolvedPath) != null;
+            signatureParts.Add(string.Join(":", new[]
+            {
+                isFolder ? "F" : "P",
+                guid,
+                entry.LastKnownPath ?? string.Empty,
+                resolvedPath,
+                valid ? "1" : "0"
+            }));
+
+            if (!valid)
+            {
+                continue;
+            }
+
+            if (isFolder)
+            {
+                folderPaths.Add(resolvedPath.TrimEnd('/'));
+            }
+            else
+            {
+                exactPrefabGuids.Add(guid);
+            }
+        }
+    }
+
+    private void ScanTransform(
+        Transform current,
+        Transform scanRoot,
+        IgnoreListSnapshot ignoreListSnapshot,
+        Dictionary<UnityEngine.Object, bool> expandedBySource,
+        List<ImageSlot> newSlots,
+        Dictionary<string, SkippedPrefabSummary> skippedByGuid,
+        List<string> warnings)
+    {
+        if (current == null)
+        {
+            return;
+        }
+
+        if (current != scanRoot
+            && PrefabUtility.IsAnyPrefabInstanceRoot(current.gameObject)
+            && PrefabUtility.GetNearestPrefabInstanceRoot(current.gameObject) == current.gameObject)
+        {
+            var sourcePath = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(current.gameObject);
+            sourcePath = string.IsNullOrEmpty(sourcePath)
+                ? string.Empty
+                : sourcePath.Replace('\\', '/');
+            var sourceGuid = string.IsNullOrEmpty(sourcePath)
+                ? string.Empty
+                : AssetDatabase.AssetPathToGUID(sourcePath);
+            if (string.IsNullOrEmpty(sourcePath) || string.IsNullOrEmpty(sourceGuid))
+            {
+                AddScanWarning(
+                    warnings,
+                    "无法解析嵌套 Prefab 源：" + BuildTransformPath(current, scanRoot));
+            }
+            else if (ignoreListSnapshot.Matches(sourceGuid, sourcePath))
+            {
+                SkippedPrefabSummary summary;
+                if (!skippedByGuid.TryGetValue(sourceGuid, out summary))
+                {
+                    summary = new SkippedPrefabSummary
+                    {
+                        Guid = sourceGuid,
+                        Path = sourcePath,
+                        InstanceCount = 0
+                    };
+                    skippedByGuid.Add(sourceGuid, summary);
+                }
+
+                summary.InstanceCount++;
+                return;
+            }
+        }
+
+        foreach (var image in current.GetComponents<Image>())
+        {
+            if (image.sprite != null)
+            {
+                newSlots.Add(CreateSlot(image, SlotKind.Image, expandedBySource));
+            }
+        }
+
+        foreach (var rawImage in current.GetComponents<RawImage>())
+        {
+            if (rawImage.texture != null)
+            {
+                newSlots.Add(CreateSlot(rawImage, SlotKind.RawImage, expandedBySource));
+            }
+        }
+
+        for (var index = 0; index < current.childCount; index++)
+        {
+            ScanTransform(
+                current.GetChild(index),
+                scanRoot,
+                ignoreListSnapshot,
+                expandedBySource,
+                newSlots,
+                skippedByGuid,
+                warnings);
+        }
+    }
+
+    private static void AddScanWarning(List<string> warnings, string warning)
+    {
+        if (!warnings.Contains(warning))
+        {
+            warnings.Add(warning);
+        }
     }
 
     private ImageSlot CreateSlot(
@@ -1488,6 +1809,11 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         currentPage = 0;
         scrollPosition = Vector2.zero;
         hasSession = false;
+        hasIgnoreListSnapshot = false;
+        scannedIgnoreListSignature = string.Empty;
+        skippedPrefabInstanceCount = 0;
+        skippedPrefabs = new List<SkippedPrefabSummary>();
+        scanWarnings = new List<string>();
         SessionState.EraseString(SessionKey);
         Repaint();
     }
@@ -1508,7 +1834,12 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             TargetDisplayName = targetDisplayName,
             SearchText = searchText,
             CurrentPage = currentPage,
-            Slots = slots.Select(PersistedSlotData.Capture).ToList()
+            Slots = slots.Select(PersistedSlotData.Capture).ToList(),
+            HasIgnoreListSnapshot = hasIgnoreListSnapshot,
+            IgnoreListSignature = scannedIgnoreListSignature,
+            SkippedPrefabInstanceCount = skippedPrefabInstanceCount,
+            SkippedPrefabs = skippedPrefabs,
+            ScanWarnings = scanWarnings
         };
         serializedVersion = SessionVersion;
         SessionState.SetString(SessionKey, JsonUtility.ToJson(data));
@@ -1536,6 +1867,17 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             targetDisplayName = data.TargetDisplayName ?? string.Empty;
             searchText = data.SearchText ?? string.Empty;
             currentPage = data.CurrentPage;
+            hasIgnoreListSnapshot = data.Version >= 4 && data.HasIgnoreListSnapshot;
+            scannedIgnoreListSignature = hasIgnoreListSnapshot
+                ? data.IgnoreListSignature ?? string.Empty
+                : string.Empty;
+            skippedPrefabInstanceCount = hasIgnoreListSnapshot ? data.SkippedPrefabInstanceCount : 0;
+            skippedPrefabs = hasIgnoreListSnapshot && data.SkippedPrefabs != null
+                ? data.SkippedPrefabs.Where(item => item != null).ToList()
+                : new List<SkippedPrefabSummary>();
+            scanWarnings = hasIgnoreListSnapshot && data.ScanWarnings != null
+                ? data.ScanWarnings.Where(item => !string.IsNullOrEmpty(item)).ToList()
+                : new List<string>();
             slots = data.Slots == null
                 ? new List<ImageSlot>()
                 : data.Slots.Where(item => item != null)
@@ -1607,6 +1949,39 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         return resolution == Vector2Int.zero
             ? "未知"
             : string.Format("{0} x {1}", resolution.x, resolution.y);
+    }
+
+    [Serializable]
+    private sealed class SkippedPrefabSummary
+    {
+        public string Guid;
+        public string Path;
+        public int InstanceCount;
+    }
+
+    private sealed class IgnoreListSnapshot
+    {
+        public HashSet<string> ExactPrefabGuids;
+        public List<string> FolderPaths;
+        public string Signature;
+
+        public bool Matches(string prefabGuid, string prefabPath)
+        {
+            if (ExactPrefabGuids.Contains(prefabGuid))
+            {
+                return true;
+            }
+
+            foreach (var folderPath in FolderPaths)
+            {
+                if (prefabPath.StartsWith(folderPath + "/", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
     private enum SaveMode
@@ -1859,6 +2234,11 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         public string SearchText;
         public int CurrentPage;
         public List<PersistedSlotData> Slots;
+        public bool HasIgnoreListSnapshot;
+        public string IgnoreListSignature;
+        public int SkippedPrefabInstanceCount;
+        public List<SkippedPrefabSummary> SkippedPrefabs;
+        public List<string> ScanWarnings;
     }
 
     [Serializable]
