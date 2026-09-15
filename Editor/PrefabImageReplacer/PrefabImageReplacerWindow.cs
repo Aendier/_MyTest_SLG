@@ -1113,7 +1113,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             prefabFolderPaths,
             signatureParts);
         AddAssetIgnoreListEntries(
-            ignoreListConfig.IgnoredFolders,
+            ignoreListConfig.IgnoredPrefabFolders,
             true,
             "PF",
             exactPrefabGuids,

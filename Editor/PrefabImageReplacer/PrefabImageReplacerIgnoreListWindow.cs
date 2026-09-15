@@ -54,7 +54,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
                 GUILayout.Label(
                     string.Format(
                         "Prefab 规则 {0}    Sprite 规则 {1}",
-                        ignoreListConfig.IgnoredPrefabs.Count + ignoreListConfig.IgnoredFolders.Count,
+                        ignoreListConfig.IgnoredPrefabs.Count + ignoreListConfig.IgnoredPrefabFolders.Count,
                         ignoreListConfig.IgnoredSprites.Count + ignoreListConfig.IgnoredSpriteFolders.Count),
                     EditorStyles.miniBoldLabel);
             }
@@ -106,7 +106,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
                 "忽略 Prefab 文件夹",
                 "忽略文件夹及其子文件夹中的所有 Prefab。",
                 "暂无忽略的 Prefab 文件夹。",
-                ignoreListConfig.IgnoredFolders,
+                ignoreListConfig.IgnoredPrefabFolders,
                 IgnoreAssetKind.PrefabFolder);
 
             EditorGUILayout.Space(16f);

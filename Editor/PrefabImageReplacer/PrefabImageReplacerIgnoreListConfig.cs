@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 /// <summary>
 /// A persisted ignore-list item. Assets and folders use their GUID; Sprite
@@ -191,8 +192,9 @@ public sealed class PrefabImageReplacerIgnoreListConfig : ScriptableObject
     [SerializeField, InspectorName("忽略 Prefab")]
     private List<PrefabImageReplacerIgnoreEntry> ignoredPrefabs = new List<PrefabImageReplacerIgnoreEntry>();
 
+    [FormerlySerializedAs("ignoredFolders")]
     [SerializeField, InspectorName("忽略 Prefab 文件夹")]
-    private List<PrefabImageReplacerIgnoreEntry> ignoredFolders = new List<PrefabImageReplacerIgnoreEntry>();
+    private List<PrefabImageReplacerIgnoreEntry> ignoredPrefabFolders = new List<PrefabImageReplacerIgnoreEntry>();
 
     [SerializeField, InspectorName("忽略 Sprite")]
     private List<PrefabImageReplacerIgnoreEntry> ignoredSprites = new List<PrefabImageReplacerIgnoreEntry>();
@@ -213,12 +215,12 @@ public sealed class PrefabImageReplacerIgnoreListConfig : ScriptableObject
         }
     }
 
-    public IList<PrefabImageReplacerIgnoreEntry> IgnoredFolders
+    public IList<PrefabImageReplacerIgnoreEntry> IgnoredPrefabFolders
     {
         get
         {
             EnsureLists();
-            return ignoredFolders;
+            return ignoredPrefabFolders;
         }
     }
 
@@ -374,8 +376,8 @@ public sealed class PrefabImageReplacerIgnoreListConfig : ScriptableObject
     {
         if (ignoredPrefabs == null)
             ignoredPrefabs = new List<PrefabImageReplacerIgnoreEntry>();
-        if (ignoredFolders == null)
-            ignoredFolders = new List<PrefabImageReplacerIgnoreEntry>();
+        if (ignoredPrefabFolders == null)
+            ignoredPrefabFolders = new List<PrefabImageReplacerIgnoreEntry>();
         if (ignoredSprites == null)
             ignoredSprites = new List<PrefabImageReplacerIgnoreEntry>();
         if (ignoredSpriteFolders == null)
