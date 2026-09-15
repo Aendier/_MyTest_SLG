@@ -5,18 +5,22 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// A persisted ignore-list item.  Only the asset GUID and the last known path
-/// are stored so deleting or moving an asset does not turn the item into a
-/// dangling Unity object reference.
+/// A persisted ignore-list item. Assets and folders use their GUID; Sprite
+/// sub-assets additionally use a local file ID so one slice can be identified
+/// without retaining a dangling Unity object reference.
 /// </summary>
 [Serializable]
 public sealed class PrefabImageReplacerIgnoreEntry
 {
     [SerializeField] private string guid = string.Empty;
+    [SerializeField] private long localFileId;
     [SerializeField] private string lastKnownPath = string.Empty;
+    [SerializeField] private string lastKnownName = string.Empty;
 
     public string Guid => guid ?? string.Empty;
+    public long LocalFileId => localFileId;
     public string LastKnownPath => lastKnownPath ?? string.Empty;
+    public string LastKnownName => lastKnownName ?? string.Empty;
 
     public PrefabImageReplacerIgnoreEntry()
     {
@@ -25,7 +29,21 @@ public sealed class PrefabImageReplacerIgnoreEntry
     public PrefabImageReplacerIgnoreEntry(string guid, string lastKnownPath)
     {
         this.guid = NormalizeGuid(guid);
+        localFileId = 0;
         this.lastKnownPath = NormalizePath(lastKnownPath);
+        lastKnownName = string.Empty;
+    }
+
+    public PrefabImageReplacerIgnoreEntry(
+        string guid,
+        long localFileId,
+        string lastKnownPath,
+        string lastKnownName)
+    {
+        this.guid = NormalizeGuid(guid);
+        this.localFileId = localFileId;
+        this.lastKnownPath = NormalizePath(lastKnownPath);
+        this.lastKnownName = NormalizeName(lastKnownName);
     }
 
     /// <summary>
@@ -40,6 +58,27 @@ public sealed class PrefabImageReplacerIgnoreEntry
     public static PrefabImageReplacerIgnoreEntry Create(string assetPath)
     {
         return new PrefabImageReplacerIgnoreEntry(assetPath);
+    }
+
+    public static PrefabImageReplacerIgnoreEntry Create(Sprite sprite)
+    {
+        if (sprite == null)
+            throw new ArgumentNullException(nameof(sprite));
+
+        string assetGuid;
+        long assetLocalFileId;
+        if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sprite, out assetGuid, out assetLocalFileId))
+        {
+            throw new ArgumentException(
+                "The Sprite does not resolve to a GUID and local file ID: " + sprite.name,
+                nameof(sprite));
+        }
+
+        return new PrefabImageReplacerIgnoreEntry(
+            assetGuid,
+            assetLocalFileId,
+            AssetDatabase.GetAssetPath(sprite),
+            sprite.name);
     }
 
     /// <summary>
@@ -62,7 +101,48 @@ public sealed class PrefabImageReplacerIgnoreEntry
     internal void SetValues(string entryGuid, string assetPath)
     {
         guid = NormalizeGuid(entryGuid);
+        localFileId = 0;
         lastKnownPath = NormalizePath(assetPath);
+        lastKnownName = string.Empty;
+    }
+
+    internal void SetValues(
+        string entryGuid,
+        long entryLocalFileId,
+        string assetPath,
+        string assetName)
+    {
+        guid = NormalizeGuid(entryGuid);
+        localFileId = entryLocalFileId;
+        lastKnownPath = NormalizePath(assetPath);
+        lastKnownName = NormalizeName(assetName);
+    }
+
+    internal Sprite ResolveSprite(out string currentPath)
+    {
+        currentPath = string.IsNullOrEmpty(Guid)
+            ? string.Empty
+            : AssetDatabase.GUIDToAssetPath(Guid);
+        if (string.IsNullOrEmpty(currentPath) || localFileId == 0)
+            return null;
+
+        foreach (var asset in AssetDatabase.LoadAllAssetsAtPath(currentPath))
+        {
+            var sprite = asset as Sprite;
+            if (sprite == null)
+                continue;
+
+            string spriteGuid;
+            long spriteLocalFileId;
+            if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sprite, out spriteGuid, out spriteLocalFileId)
+                && string.Equals(spriteGuid, Guid, StringComparison.OrdinalIgnoreCase)
+                && spriteLocalFileId == localFileId)
+            {
+                return sprite;
+            }
+        }
+
+        return null;
     }
 
     private void InitializeFromAssetPath(string assetPath)
@@ -78,7 +158,9 @@ public sealed class PrefabImageReplacerIgnoreEntry
                 nameof(assetPath));
 
         guid = NormalizeGuid(assetGuid);
+        localFileId = 0;
         lastKnownPath = normalizedPath;
+        lastKnownName = string.Empty;
     }
 
     private static string NormalizeGuid(string value)
@@ -92,6 +174,11 @@ public sealed class PrefabImageReplacerIgnoreEntry
             ? string.Empty
             : value.Replace('\\', '/').Trim();
     }
+
+    private static string NormalizeName(string value)
+    {
+        return string.IsNullOrEmpty(value) ? string.Empty : value.Trim();
+    }
 }
 
 /// <summary>
@@ -104,8 +191,14 @@ public sealed class PrefabImageReplacerIgnoreListConfig : ScriptableObject
     [SerializeField, InspectorName("忽略 Prefab")]
     private List<PrefabImageReplacerIgnoreEntry> ignoredPrefabs = new List<PrefabImageReplacerIgnoreEntry>();
 
-    [SerializeField, InspectorName("忽略文件夹")]
+    [SerializeField, InspectorName("忽略 Prefab 文件夹")]
     private List<PrefabImageReplacerIgnoreEntry> ignoredFolders = new List<PrefabImageReplacerIgnoreEntry>();
+
+    [SerializeField, InspectorName("忽略 Sprite")]
+    private List<PrefabImageReplacerIgnoreEntry> ignoredSprites = new List<PrefabImageReplacerIgnoreEntry>();
+
+    [SerializeField, InspectorName("忽略 Sprite 文件夹")]
+    private List<PrefabImageReplacerIgnoreEntry> ignoredSpriteFolders = new List<PrefabImageReplacerIgnoreEntry>();
 
     /// <summary>
     /// The serialized lists are exposed as IList so callers can add/remove
@@ -126,6 +219,24 @@ public sealed class PrefabImageReplacerIgnoreListConfig : ScriptableObject
         {
             EnsureLists();
             return ignoredFolders;
+        }
+    }
+
+    public IList<PrefabImageReplacerIgnoreEntry> IgnoredSprites
+    {
+        get
+        {
+            EnsureLists();
+            return ignoredSprites;
+        }
+    }
+
+    public IList<PrefabImageReplacerIgnoreEntry> IgnoredSpriteFolders
+    {
+        get
+        {
+            EnsureLists();
+            return ignoredSpriteFolders;
         }
     }
 
@@ -265,6 +376,10 @@ public sealed class PrefabImageReplacerIgnoreListConfig : ScriptableObject
             ignoredPrefabs = new List<PrefabImageReplacerIgnoreEntry>();
         if (ignoredFolders == null)
             ignoredFolders = new List<PrefabImageReplacerIgnoreEntry>();
+        if (ignoredSprites == null)
+            ignoredSprites = new List<PrefabImageReplacerIgnoreEntry>();
+        if (ignoredSpriteFolders == null)
+            ignoredSpriteFolders = new List<PrefabImageReplacerIgnoreEntry>();
     }
 
     private static string NormalizeAssetPath(string assetPath)

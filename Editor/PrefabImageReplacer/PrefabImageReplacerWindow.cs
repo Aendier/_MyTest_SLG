@@ -33,6 +33,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     [SerializeField] private bool hasIgnoreListSnapshot;
     [SerializeField] private string scannedIgnoreListSignature = string.Empty;
     [SerializeField] private int skippedPrefabInstanceCount;
+    [SerializeField] private int skippedSpriteReferenceCount;
     [SerializeField] private List<SkippedPrefabSummary> skippedPrefabs = new List<SkippedPrefabSummary>();
     [SerializeField] private List<string> scanWarnings = new List<string>();
 
@@ -360,7 +361,11 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         }
 
         EditorGUILayout.LabelField(
-            string.Format("忽略列表跳过：{0} 个实例 / {1} 个 Prefab 资源", skippedPrefabInstanceCount, skippedPrefabs.Count),
+            string.Format(
+                "忽略列表跳过：{0} 个 Prefab 实例 / {1} 个 Prefab 资源 / {2} 个 Sprite 引用",
+                skippedPrefabInstanceCount,
+                skippedPrefabs.Count,
+                skippedSpriteReferenceCount),
             EditorStyles.miniLabel);
         if (skippedPrefabs.Count > 0)
         {
@@ -1047,6 +1052,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
         var ignoreListSnapshot = CaptureIgnoreListSnapshot();
         var skippedByGuid = new Dictionary<string, SkippedPrefabSummary>(StringComparer.OrdinalIgnoreCase);
+        var skippedSpriteReferences = 0;
         var warnings = new List<string>();
         isScanning = true;
         try
@@ -1058,6 +1064,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 expandedBySource,
                 newSlots,
                 skippedByGuid,
+                ref skippedSpriteReferences,
                 warnings);
         }
         catch (Exception exception)
@@ -1081,6 +1088,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         hasIgnoreListSnapshot = true;
         scannedIgnoreListSignature = ignoreListSnapshot.Signature;
         skippedPrefabInstanceCount = skippedByGuid.Values.Sum(item => item.InstanceCount);
+        skippedSpriteReferenceCount = skippedSpriteReferences;
         skippedPrefabs = skippedByGuid.Values
             .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -1092,27 +1100,47 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     private IgnoreListSnapshot CaptureIgnoreListSnapshot()
     {
         var exactPrefabGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var folderPaths = new List<string>();
+        var prefabFolderPaths = new List<string>();
+        var exactSprites = new HashSet<Sprite>();
+        var spriteFolderPaths = new List<string>();
         var signatureParts = new List<string>();
 
-        AddIgnoreListEntries(
+        AddAssetIgnoreListEntries(
             ignoreListConfig.IgnoredPrefabs,
             false,
+            "P",
             exactPrefabGuids,
-            folderPaths,
+            prefabFolderPaths,
             signatureParts);
-        AddIgnoreListEntries(
+        AddAssetIgnoreListEntries(
             ignoreListConfig.IgnoredFolders,
             true,
+            "PF",
             exactPrefabGuids,
-            folderPaths,
+            prefabFolderPaths,
+            signatureParts);
+        AddSpriteIgnoreListEntries(
+            ignoreListConfig.IgnoredSprites,
+            exactSprites,
+            signatureParts);
+        AddAssetIgnoreListEntries(
+            ignoreListConfig.IgnoredSpriteFolders,
+            true,
+            "SF",
+            null,
+            spriteFolderPaths,
             signatureParts);
 
         signatureParts.Sort(StringComparer.Ordinal);
         return new IgnoreListSnapshot
         {
             ExactPrefabGuids = exactPrefabGuids,
-            FolderPaths = folderPaths
+            PrefabFolderPaths = prefabFolderPaths
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
+            ExactSprites = exactSprites,
+            SpriteFolderPaths = spriteFolderPaths
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToList(),
@@ -1120,9 +1148,10 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         };
     }
 
-    private static void AddIgnoreListEntries(
+    private static void AddAssetIgnoreListEntries(
         IList<PrefabImageReplacerIgnoreEntry> entries,
         bool isFolder,
+        string signaturePrefix,
         HashSet<string> exactPrefabGuids,
         List<string> folderPaths,
         List<string> signatureParts)
@@ -1136,7 +1165,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         {
             if (entry == null)
             {
-                signatureParts.Add((isFolder ? "F" : "P") + ":<null>");
+                signatureParts.Add(signaturePrefix + ":<null>");
                 continue;
             }
 
@@ -1153,7 +1182,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                     && AssetDatabase.LoadAssetAtPath<GameObject>(resolvedPath) != null;
             signatureParts.Add(string.Join(":", new[]
             {
-                isFolder ? "F" : "P",
+                signaturePrefix,
                 guid,
                 entry.LastKnownPath ?? string.Empty,
                 resolvedPath,
@@ -1171,7 +1200,48 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             }
             else
             {
-                exactPrefabGuids.Add(guid);
+                exactPrefabGuids?.Add(guid);
+            }
+        }
+    }
+
+    private static void AddSpriteIgnoreListEntries(
+        IList<PrefabImageReplacerIgnoreEntry> entries,
+        HashSet<Sprite> exactSprites,
+        List<string> signatureParts)
+    {
+        if (entries == null)
+        {
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry == null)
+            {
+                signatureParts.Add("S:<null>");
+                continue;
+            }
+
+            string resolvedPath;
+            var sprite = entry.ResolveSprite(out resolvedPath);
+            resolvedPath = string.IsNullOrEmpty(resolvedPath)
+                ? string.Empty
+                : resolvedPath.Replace('\\', '/');
+            signatureParts.Add(string.Join(":", new[]
+            {
+                "S",
+                entry.Guid ?? string.Empty,
+                entry.LocalFileId.ToString(),
+                entry.LastKnownPath ?? string.Empty,
+                entry.LastKnownName ?? string.Empty,
+                resolvedPath,
+                sprite == null ? "0" : "1"
+            }));
+
+            if (sprite != null)
+            {
+                exactSprites.Add(sprite);
             }
         }
     }
@@ -1183,6 +1253,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         Dictionary<UnityEngine.Object, bool> expandedBySource,
         List<ImageSlot> newSlots,
         Dictionary<string, SkippedPrefabSummary> skippedByGuid,
+        ref int skippedSpriteReferences,
         List<string> warnings)
     {
         if (current == null)
@@ -1207,7 +1278,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                     warnings,
                     "无法解析嵌套 Prefab 源：" + BuildTransformPath(current, scanRoot));
             }
-            else if (ignoreListSnapshot.Matches(sourceGuid, sourcePath))
+            else if (ignoreListSnapshot.MatchesPrefab(sourceGuid, sourcePath))
             {
                 SkippedPrefabSummary summary;
                 if (!skippedByGuid.TryGetValue(sourceGuid, out summary))
@@ -1228,10 +1299,18 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
         foreach (var image in current.GetComponents<Image>())
         {
-            if (image.sprite != null)
+            if (image.sprite == null)
             {
-                newSlots.Add(CreateSlot(image, SlotKind.Image, expandedBySource));
+                continue;
             }
+
+            if (ignoreListSnapshot.MatchesSprite(image.sprite))
+            {
+                skippedSpriteReferences++;
+                continue;
+            }
+
+            newSlots.Add(CreateSlot(image, SlotKind.Image, expandedBySource));
         }
 
         foreach (var rawImage in current.GetComponents<RawImage>())
@@ -1251,6 +1330,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 expandedBySource,
                 newSlots,
                 skippedByGuid,
+                ref skippedSpriteReferences,
                 warnings);
         }
     }
@@ -1812,6 +1892,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         hasIgnoreListSnapshot = false;
         scannedIgnoreListSignature = string.Empty;
         skippedPrefabInstanceCount = 0;
+        skippedSpriteReferenceCount = 0;
         skippedPrefabs = new List<SkippedPrefabSummary>();
         scanWarnings = new List<string>();
         SessionState.EraseString(SessionKey);
@@ -1838,6 +1919,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             HasIgnoreListSnapshot = hasIgnoreListSnapshot,
             IgnoreListSignature = scannedIgnoreListSignature,
             SkippedPrefabInstanceCount = skippedPrefabInstanceCount,
+            SkippedSpriteReferenceCount = skippedSpriteReferenceCount,
             SkippedPrefabs = skippedPrefabs,
             ScanWarnings = scanWarnings
         };
@@ -1872,6 +1954,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 ? data.IgnoreListSignature ?? string.Empty
                 : string.Empty;
             skippedPrefabInstanceCount = hasIgnoreListSnapshot ? data.SkippedPrefabInstanceCount : 0;
+            skippedSpriteReferenceCount = hasIgnoreListSnapshot ? data.SkippedSpriteReferenceCount : 0;
             skippedPrefabs = hasIgnoreListSnapshot && data.SkippedPrefabs != null
                 ? data.SkippedPrefabs.Where(item => item != null).ToList()
                 : new List<SkippedPrefabSummary>();
@@ -1962,19 +2045,50 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     private sealed class IgnoreListSnapshot
     {
         public HashSet<string> ExactPrefabGuids;
-        public List<string> FolderPaths;
+        public List<string> PrefabFolderPaths;
+        public HashSet<Sprite> ExactSprites;
+        public List<string> SpriteFolderPaths;
         public string Signature;
 
-        public bool Matches(string prefabGuid, string prefabPath)
+        public bool MatchesPrefab(string prefabGuid, string prefabPath)
         {
             if (ExactPrefabGuids.Contains(prefabGuid))
             {
                 return true;
             }
 
-            foreach (var folderPath in FolderPaths)
+            return IsInFolder(prefabPath, PrefabFolderPaths);
+        }
+
+        public bool MatchesSprite(Sprite sprite)
+        {
+            if (sprite == null)
             {
-                if (prefabPath.StartsWith(folderPath + "/", StringComparison.OrdinalIgnoreCase))
+                return false;
+            }
+
+            if (ExactSprites.Contains(sprite))
+            {
+                return true;
+            }
+
+            if (SpriteFolderPaths.Count == 0)
+            {
+                return false;
+            }
+
+            var spritePath = AssetDatabase.GetAssetPath(sprite);
+            spritePath = string.IsNullOrEmpty(spritePath)
+                ? string.Empty
+                : spritePath.Replace('\\', '/');
+            return IsInFolder(spritePath, SpriteFolderPaths);
+        }
+
+        private static bool IsInFolder(string assetPath, IEnumerable<string> folderPaths)
+        {
+            foreach (var folderPath in folderPaths)
+            {
+                if (assetPath.StartsWith(folderPath + "/", StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
@@ -2237,6 +2351,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         public bool HasIgnoreListSnapshot;
         public string IgnoreListSignature;
         public int SkippedPrefabInstanceCount;
+        public int SkippedSpriteReferenceCount;
         public List<SkippedPrefabSummary> SkippedPrefabs;
         public List<string> ScanWarnings;
     }

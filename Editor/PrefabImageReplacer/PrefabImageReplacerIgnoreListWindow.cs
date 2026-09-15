@@ -12,7 +12,9 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
     [NonSerialized] private string configError = string.Empty;
     [NonSerialized] private string editMessage = string.Empty;
     [NonSerialized] private GameObject pendingPrefab;
-    [NonSerialized] private DefaultAsset pendingFolder;
+    [NonSerialized] private DefaultAsset pendingPrefabFolder;
+    [NonSerialized] private Sprite pendingSprite;
+    [NonSerialized] private DefaultAsset pendingSpriteFolder;
 
     [MenuItem("UIR/Prefab Image Replacer Ignore List")]
     public static void Open()
@@ -51,15 +53,16 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
                 GUILayout.FlexibleSpace();
                 GUILayout.Label(
                     string.Format(
-                        "Prefab {0}    文件夹 {1}",
-                        ignoreListConfig.IgnoredPrefabs.Count,
-                        ignoreListConfig.IgnoredFolders.Count),
+                        "Prefab 规则 {0}    Sprite 规则 {1}",
+                        ignoreListConfig.IgnoredPrefabs.Count + ignoreListConfig.IgnoredFolders.Count,
+                        ignoreListConfig.IgnoredSprites.Count + ignoreListConfig.IgnoredSpriteFolders.Count),
                     EditorStyles.miniBoldLabel);
             }
         }
 
         EditorGUILayout.HelpBox(
-            "扫描时会跳过命中的嵌套 Prefab 实例及其完整子树。修改后请在 Prefab Image Replacer 中重新扫描。",
+            "Prefab 规则会跳过命中的嵌套实例及其完整子树；Sprite 规则会过滤 Image 使用的原始 Sprite，"
+            + "不影响 RawImage。修改后请在 Prefab Image Replacer 中重新扫描。",
             MessageType.Info);
 
         var editingDisabled = EditorApplication.isPlayingOrWillChangePlaymode;
@@ -91,19 +94,36 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
         scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
         using (new EditorGUI.DisabledScope(editingDisabled))
         {
+            EditorGUILayout.LabelField("Prefab 实例", EditorStyles.boldLabel);
             DrawIgnoreListSection(
                 "忽略 Prefab",
                 "精确忽略选中的 Prefab，扫描时跳过对应实例的完整子树。",
                 "暂无忽略的 Prefab。",
                 ignoreListConfig.IgnoredPrefabs,
-                false);
+                IgnoreAssetKind.Prefab);
             EditorGUILayout.Space(10f);
             DrawIgnoreListSection(
-                "忽略文件夹",
+                "忽略 Prefab 文件夹",
                 "忽略文件夹及其子文件夹中的所有 Prefab。",
-                "暂无忽略的文件夹。",
+                "暂无忽略的 Prefab 文件夹。",
                 ignoreListConfig.IgnoredFolders,
-                true);
+                IgnoreAssetKind.PrefabFolder);
+
+            EditorGUILayout.Space(16f);
+            EditorGUILayout.LabelField("Sprite 资源", EditorStyles.boldLabel);
+            DrawIgnoreListSection(
+                "忽略 Sprite",
+                "精确忽略选中的 Sprite；同一纹理中的其他 Sprite 仍会参与扫描。",
+                "暂无忽略的 Sprite。",
+                ignoreListConfig.IgnoredSprites,
+                IgnoreAssetKind.Sprite);
+            EditorGUILayout.Space(10f);
+            DrawIgnoreListSection(
+                "忽略 Sprite 文件夹",
+                "忽略文件夹及其子文件夹中的所有 Sprite。",
+                "暂无忽略的 Sprite 文件夹。",
+                ignoreListConfig.IgnoredSpriteFolders,
+                IgnoreAssetKind.SpriteFolder);
         }
 
         EditorGUILayout.EndScrollView();
@@ -130,11 +150,11 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
         string description,
         string emptyMessage,
         IList<PrefabImageReplacerIgnoreEntry> entries,
-        bool isFolder)
+        IgnoreAssetKind kind)
     {
         using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
         {
-            DrawSectionHeader(label, entries == null ? 0 : entries.Count, isFolder);
+            DrawSectionHeader(label, entries == null ? 0 : entries.Count, kind);
             EditorGUILayout.LabelField(description, EditorStyles.wordWrappedMiniLabel);
             EditorGUILayout.Space(4f);
 
@@ -160,7 +180,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
                         DrawSeparator();
                     }
 
-                    if (DrawIgnoreListRow(entries, index, isFolder))
+                    if (DrawIgnoreListRow(entries, index, kind))
                     {
                         return;
                     }
@@ -170,15 +190,18 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
             EditorGUILayout.Space(4f);
             DrawSeparator();
             EditorGUILayout.Space(4f);
-            DrawAddControls(isFolder, entries);
+            DrawAddControls(kind, entries);
         }
     }
 
-    private static void DrawSectionHeader(string label, int count, bool isFolder)
+    private static void DrawSectionHeader(string label, int count, IgnoreAssetKind kind)
     {
         using (new EditorGUILayout.HorizontalScope())
         {
-            var icon = EditorGUIUtility.IconContent(isFolder ? "Folder Icon" : "Prefab Icon");
+            var iconName = IsFolderKind(kind)
+                ? "Folder Icon"
+                : kind == IgnoreAssetKind.Sprite ? "Sprite Icon" : "Prefab Icon";
+            var icon = EditorGUIUtility.IconContent(iconName);
             GUILayout.Label(icon, GUILayout.Width(20f), GUILayout.Height(18f));
             GUILayout.Label(label, EditorStyles.boldLabel);
             GUILayout.FlexibleSpace();
@@ -189,19 +212,19 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
     private bool DrawIgnoreListRow(
         IList<PrefabImageReplacerIgnoreEntry> entries,
         int index,
-        bool isFolder)
+        IgnoreAssetKind kind)
     {
         var entry = entries[index];
         string currentPath;
         string warning;
-        var currentObject = ResolveIgnoreListObject(entry, isFolder, out currentPath, out warning);
+        var currentObject = ResolveIgnoreListObject(entry, kind, out currentPath, out warning);
 
         using (new EditorGUILayout.HorizontalScope())
         {
             EditorGUI.BeginChangeCheck();
             var picked = EditorGUILayout.ObjectField(
                 currentObject,
-                isFolder ? typeof(DefaultAsset) : typeof(GameObject),
+                GetObjectType(kind),
                 false);
             var changed = EditorGUI.EndChangeCheck();
 
@@ -211,13 +234,13 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
                     GUILayout.Width(28f),
                     GUILayout.Height(EditorGUIUtility.singleLineHeight)))
             {
-                ModifyConfig("删除 Prefab 忽略列表条目", () => entries.RemoveAt(index));
+                ModifyConfig("删除 " + GetKindLabel(kind) + " 忽略列表条目", () => entries.RemoveAt(index));
                 return true;
             }
 
             if (changed)
             {
-                ChangeIgnoreListEntry(entries, index, entry, picked, isFolder);
+                ChangeIgnoreListEntry(entries, index, entry, picked, kind);
                 return picked == null;
             }
         }
@@ -232,7 +255,9 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
             {
                 GUILayout.Space(4f);
                 EditorGUILayout.LabelField(
-                    new GUIContent("路径  " + currentPath, currentPath),
+                    new GUIContent(
+                        "路径  " + currentPath + GetSubAssetLabel(currentObject, kind),
+                        currentPath),
                     EditorStyles.wordWrappedMiniLabel);
             }
         }
@@ -245,36 +270,47 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
         int index,
         PrefabImageReplacerIgnoreEntry entry,
         UnityEngine.Object picked,
-        bool isFolder)
+        IgnoreAssetKind kind)
     {
         if (picked == null)
         {
-            ModifyConfig("删除 Prefab 忽略列表条目", () => entries.RemoveAt(index));
+            ModifyConfig("删除 " + GetKindLabel(kind) + " 忽略列表条目", () => entries.RemoveAt(index));
             return;
         }
 
-        var pickedPath = AssetDatabase.GetAssetPath(picked);
+        string pickedPath;
+        string pickedGuid;
+        long pickedLocalFileId;
         string validationError;
-        if (!ValidateIgnoreListAsset(pickedPath, isFolder, out validationError))
+        if (!TryGetIgnoreListIdentity(
+                picked,
+                kind,
+                out pickedPath,
+                out pickedGuid,
+                out pickedLocalFileId,
+                out validationError))
         {
             editMessage = validationError;
             return;
         }
 
-        var pickedGuid = AssetDatabase.AssetPathToGUID(pickedPath);
         if (entries.Any(item => item != null
             && item != entry
-            && string.Equals(item.Guid, pickedGuid, StringComparison.OrdinalIgnoreCase)))
+            && EntryMatches(item, kind, pickedGuid, pickedLocalFileId)))
         {
             editMessage = "该资源已经在忽略列表中。";
             return;
         }
 
-        ModifyConfig("修改 Prefab 忽略列表条目", () =>
+        ModifyConfig("修改 " + GetKindLabel(kind) + " 忽略列表条目", () =>
         {
             if (entry == null)
             {
-                entries[index] = PrefabImageReplacerIgnoreEntry.Create(pickedPath);
+                entries[index] = CreateEntry(picked, kind, pickedPath);
+            }
+            else if (kind == IgnoreAssetKind.Sprite)
+            {
+                entry.SetValues(pickedGuid, pickedLocalFileId, pickedPath, picked.name);
             }
             else
             {
@@ -283,48 +319,32 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
         });
     }
 
-    private void DrawAddControls(bool isFolder, IList<PrefabImageReplacerIgnoreEntry> entries)
+    private void DrawAddControls(
+        IgnoreAssetKind kind,
+        IList<PrefabImageReplacerIgnoreEntry> entries)
     {
         using (new EditorGUILayout.HorizontalScope())
         {
-            if (isFolder)
+            var pendingAsset = GetPendingAsset(kind);
+            pendingAsset = EditorGUILayout.ObjectField(
+                "添加 " + GetKindLabel(kind),
+                pendingAsset,
+                GetObjectType(kind),
+                false);
+            SetPendingAsset(kind, pendingAsset);
+            using (new EditorGUI.DisabledScope(pendingAsset == null))
             {
-                pendingFolder = (DefaultAsset)EditorGUILayout.ObjectField(
-                    "添加文件夹",
-                    pendingFolder,
-                    typeof(DefaultAsset),
-                    false);
-                using (new EditorGUI.DisabledScope(pendingFolder == null))
+                var addContent = CreateIconContent(
+                    "Toolbar Plus",
+                    "+",
+                    "添加选中的 " + GetKindLabel(kind));
+                if (GUILayout.Button(
+                        addContent,
+                        GUILayout.Width(28f),
+                        GUILayout.Height(EditorGUIUtility.singleLineHeight)))
                 {
-                    var addContent = CreateIconContent("Toolbar Plus", "+", "添加选中的文件夹");
-                    if (GUILayout.Button(
-                            addContent,
-                            GUILayout.Width(28f),
-                            GUILayout.Height(EditorGUIUtility.singleLineHeight)))
-                    {
-                        AddIgnoreListAsset(pendingFolder, true, entries);
-                        pendingFolder = null;
-                    }
-                }
-            }
-            else
-            {
-                pendingPrefab = (GameObject)EditorGUILayout.ObjectField(
-                    "添加 Prefab",
-                    pendingPrefab,
-                    typeof(GameObject),
-                    false);
-                using (new EditorGUI.DisabledScope(pendingPrefab == null))
-                {
-                    var addContent = CreateIconContent("Toolbar Plus", "+", "添加选中的 Prefab");
-                    if (GUILayout.Button(
-                            addContent,
-                            GUILayout.Width(28f),
-                            GUILayout.Height(EditorGUIUtility.singleLineHeight)))
-                    {
-                        AddIgnoreListAsset(pendingPrefab, false, entries);
-                        pendingPrefab = null;
-                    }
+                    AddIgnoreListAsset(pendingAsset, kind, entries);
+                    SetPendingAsset(kind, null);
                 }
             }
         }
@@ -351,7 +371,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
 
     private void AddIgnoreListAsset(
         UnityEngine.Object asset,
-        bool isFolder,
+        IgnoreAssetKind kind,
         IList<PrefabImageReplacerIgnoreEntry> entries)
     {
         if (asset == null)
@@ -360,29 +380,45 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
             return;
         }
 
-        var path = AssetDatabase.GetAssetPath(asset);
+        string path;
+        string guid;
+        long localFileId;
         string validationError;
-        if (!ValidateIgnoreListAsset(path, isFolder, out validationError))
+        if (!TryGetIgnoreListIdentity(
+                asset,
+                kind,
+                out path,
+                out guid,
+                out localFileId,
+                out validationError))
         {
             editMessage = validationError;
             return;
         }
 
-        var guid = AssetDatabase.AssetPathToGUID(path);
         if (entries.Any(item => item != null
-            && string.Equals(item.Guid, guid, StringComparison.OrdinalIgnoreCase)))
+            && EntryMatches(item, kind, guid, localFileId)))
         {
             editMessage = "该资源已经在忽略列表中。";
             return;
         }
 
         ModifyConfig(
-            "添加 Prefab 忽略列表条目",
-            () => entries.Add(PrefabImageReplacerIgnoreEntry.Create(path)));
+            "添加 " + GetKindLabel(kind) + " 忽略列表条目",
+            () => entries.Add(CreateEntry(asset, kind, path)));
     }
 
-    private static bool ValidateIgnoreListAsset(string path, bool isFolder, out string error)
+    private static bool TryGetIgnoreListIdentity(
+        UnityEngine.Object asset,
+        IgnoreAssetKind kind,
+        out string path,
+        out string guid,
+        out long localFileId,
+        out string error)
     {
+        path = asset == null ? string.Empty : AssetDatabase.GetAssetPath(asset);
+        guid = string.Empty;
+        localFileId = 0;
         error = string.Empty;
         if (string.IsNullOrEmpty(path))
         {
@@ -390,7 +426,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
             return false;
         }
 
-        if (isFolder)
+        if (IsFolderKind(kind))
         {
             if (!AssetDatabase.IsValidFolder(path))
             {
@@ -398,14 +434,35 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
                 return false;
             }
         }
-        else if (!path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)
-            || AssetDatabase.LoadAssetAtPath<GameObject>(path) == null)
+        else if (kind == IgnoreAssetKind.Prefab
+            && (!path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)
+                || asset as GameObject == null
+                || AssetDatabase.LoadAssetAtPath<GameObject>(path) == null))
         {
             error = "忽略 Prefab 条目必须是项目中的 Prefab 资源。";
             return false;
         }
+        else if (kind == IgnoreAssetKind.Sprite && asset as Sprite == null)
+        {
+            error = "忽略 Sprite 条目必须是项目中的 Sprite 资源。";
+            return false;
+        }
 
-        if (string.IsNullOrEmpty(AssetDatabase.AssetPathToGUID(path)))
+        if (kind == IgnoreAssetKind.Sprite)
+        {
+            if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(asset, out guid, out localFileId)
+                || localFileId == 0)
+            {
+                error = "忽略 Sprite 资源没有可用 GUID 或 local file ID。";
+                return false;
+            }
+        }
+        else
+        {
+            guid = AssetDatabase.AssetPathToGUID(path);
+        }
+
+        if (string.IsNullOrEmpty(guid))
         {
             error = "忽略列表资源没有可用 GUID。";
             return false;
@@ -416,7 +473,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
 
     private static UnityEngine.Object ResolveIgnoreListObject(
         PrefabImageReplacerIgnoreEntry entry,
-        bool isFolder,
+        IgnoreAssetKind kind,
         out string currentPath,
         out string warning)
     {
@@ -438,7 +495,7 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
             return null;
         }
 
-        if (isFolder)
+        if (IsFolderKind(kind))
         {
             if (!AssetDatabase.IsValidFolder(currentPath))
             {
@@ -447,6 +504,21 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
             }
 
             return AssetDatabase.LoadAssetAtPath<DefaultAsset>(currentPath);
+        }
+
+        if (kind == IgnoreAssetKind.Sprite)
+        {
+            var sprite = entry.ResolveSprite(out currentPath);
+            if (sprite == null)
+            {
+                warning = string.Format(
+                    "忽略列表 Sprite 已丢失或切片标识已变化（local file ID {0}）。最后记录：{1} @ {2}",
+                    entry.LocalFileId,
+                    string.IsNullOrEmpty(entry.LastKnownName) ? "未知名称" : entry.LastKnownName,
+                    string.IsNullOrEmpty(entry.LastKnownPath) ? currentPath : entry.LastKnownPath);
+            }
+
+            return sprite;
         }
 
         if (!currentPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
@@ -463,6 +535,95 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
         }
 
         return prefab;
+    }
+
+    private UnityEngine.Object GetPendingAsset(IgnoreAssetKind kind)
+    {
+        switch (kind)
+        {
+            case IgnoreAssetKind.Prefab:
+                return pendingPrefab;
+            case IgnoreAssetKind.PrefabFolder:
+                return pendingPrefabFolder;
+            case IgnoreAssetKind.Sprite:
+                return pendingSprite;
+            default:
+                return pendingSpriteFolder;
+        }
+    }
+
+    private void SetPendingAsset(IgnoreAssetKind kind, UnityEngine.Object asset)
+    {
+        switch (kind)
+        {
+            case IgnoreAssetKind.Prefab:
+                pendingPrefab = asset as GameObject;
+                break;
+            case IgnoreAssetKind.PrefabFolder:
+                pendingPrefabFolder = asset as DefaultAsset;
+                break;
+            case IgnoreAssetKind.Sprite:
+                pendingSprite = asset as Sprite;
+                break;
+            default:
+                pendingSpriteFolder = asset as DefaultAsset;
+                break;
+        }
+    }
+
+    private static PrefabImageReplacerIgnoreEntry CreateEntry(
+        UnityEngine.Object asset,
+        IgnoreAssetKind kind,
+        string path)
+    {
+        return kind == IgnoreAssetKind.Sprite
+            ? PrefabImageReplacerIgnoreEntry.Create((Sprite)asset)
+            : PrefabImageReplacerIgnoreEntry.Create(path);
+    }
+
+    private static bool EntryMatches(
+        PrefabImageReplacerIgnoreEntry entry,
+        IgnoreAssetKind kind,
+        string guid,
+        long localFileId)
+    {
+        return string.Equals(entry.Guid, guid, StringComparison.OrdinalIgnoreCase)
+            && (kind != IgnoreAssetKind.Sprite || entry.LocalFileId == localFileId);
+    }
+
+    private static bool IsFolderKind(IgnoreAssetKind kind)
+    {
+        return kind == IgnoreAssetKind.PrefabFolder || kind == IgnoreAssetKind.SpriteFolder;
+    }
+
+    private static Type GetObjectType(IgnoreAssetKind kind)
+    {
+        if (IsFolderKind(kind))
+            return typeof(DefaultAsset);
+
+        return kind == IgnoreAssetKind.Sprite ? typeof(Sprite) : typeof(GameObject);
+    }
+
+    private static string GetKindLabel(IgnoreAssetKind kind)
+    {
+        switch (kind)
+        {
+            case IgnoreAssetKind.Prefab:
+                return "Prefab";
+            case IgnoreAssetKind.PrefabFolder:
+                return "Prefab 文件夹";
+            case IgnoreAssetKind.Sprite:
+                return "Sprite";
+            default:
+                return "Sprite 文件夹";
+        }
+    }
+
+    private static string GetSubAssetLabel(UnityEngine.Object asset, IgnoreAssetKind kind)
+    {
+        return kind == IgnoreAssetKind.Sprite && asset != null
+            ? "  [" + asset.name + "]"
+            : string.Empty;
     }
 
     private void ModifyConfig(string actionName, Action mutation)
@@ -486,5 +647,13 @@ public sealed class PrefabImageReplacerIgnoreListWindow : EditorWindow
         {
             AssetDatabase.SaveAssetIfDirty(ignoreListConfig);
         }
+    }
+
+    private enum IgnoreAssetKind
+    {
+        Prefab,
+        PrefabFolder,
+        Sprite,
+        SpriteFolder
     }
 }
