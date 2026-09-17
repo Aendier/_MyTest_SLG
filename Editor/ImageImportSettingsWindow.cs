@@ -8,18 +8,34 @@ namespace UIR.EditorTools
 {
     public sealed class ImageImportSettingsWindow : OdinEditorWindow
     {
+        [ShowInInspector, PropertyOrder(-2)]
+        [LabelText("当前实际生效状态")]
+        private string EffectiveStatus => _savedConfig == null
+            ? "配置不可用"
+            : _savedConfig.Enabled ? "已启用" : "未启用";
+
+        [InfoBox("编辑中的“启用自动设置”与当前实际生效状态不一致。保存配置前，图片导入仍使用上方显示的实际状态。", InfoMessageType.Warning, VisibleIf = nameof(HasPendingEnabledChange))]
+        [InfoBox("实际配置已被外部修改。为避免覆盖外部修改，保存时需要选择保留哪一份配置。", InfoMessageType.Warning, VisibleIf = nameof(HasExternalChanges))]
         [InlineEditor(InlineEditorObjectFieldModes.Hidden)]
-        [LabelText("图片导入设置配置")]
+        [LabelText("编辑中的图片导入设置（保存后生效）")]
         [ShowInInspector, PropertyOrder(-1)]
-        private ImageImportSettingsConfig Config => _editingConfig;
+        private ImageImportSettingsConfig Config
+        {
+            get => _editingConfig;
+            set => _editingConfig = value;
+        }
 
         [NonSerialized]
         private ImageImportSettingsConfig _editingConfig;
         private ImageImportSettingsConfig _savedConfig;
         private string _savedConfigSnapshot;
         private bool _hasUnsavedChanges;
+        private bool _hasExternalChanges;
 
         private bool HasUnsavedChanges => _hasUnsavedChanges;
+        private bool HasExternalChanges => _hasExternalChanges;
+        private bool HasPendingEnabledChange =>
+            Config != null && _savedConfig != null && Config.Enabled != _savedConfig.Enabled;
 
         public static void Open()
         {
@@ -31,19 +47,20 @@ namespace UIR.EditorTools
         protected override void OnEnable()
         {
             base.OnEnable();
-            OnEndGUI -= RefreshUnsavedChanges;
+            OnEndGUI -= RefreshWindowState;
             DestroyEditingCopy();
             _savedConfig = ImageImportSettingsConfig.LoadOrCreate();
             _editingConfig = CreateEditingCopy(_savedConfig);
-            _savedConfigSnapshot = SerializeConfig(Config);
+            _savedConfigSnapshot = SerializeConfig(_savedConfig);
+            SetExternalChanges(false);
             SetUnsavedChanges(false);
             saveChangesMessage = "图片导入设置已修改。保存配置后，新图片导入和已有图片应用才会使用新设置。";
-            OnEndGUI += RefreshUnsavedChanges;
+            OnEndGUI += RefreshWindowState;
         }
 
         protected override void OnDisable()
         {
-            OnEndGUI -= RefreshUnsavedChanges;
+            OnEndGUI -= RefreshWindowState;
             base.OnDisable();
         }
 
@@ -58,7 +75,7 @@ namespace UIR.EditorTools
         [GUIColor(0.35f, 0.8f, 0.45f)]
         private void SaveConfig()
         {
-            RefreshUnsavedChanges();
+            RefreshWindowState();
             if (!HasUnsavedChanges)
             {
                 Debug.Log("[ImageImportSettings] 当前没有未保存的配置修改。 ");
@@ -73,7 +90,7 @@ namespace UIR.EditorTools
         [GUIColor(0.35f, 0.8f, 0.45f)]
         private void ApplyToExistingImages()
         {
-            RefreshUnsavedChanges();
+            RefreshWindowState();
             if (Config == null || _savedConfig == null)
                 return;
 
@@ -135,7 +152,7 @@ namespace UIR.EditorTools
 
         public override void SaveChanges()
         {
-            RefreshUnsavedChanges();
+            RefreshWindowState();
             if (HasUnsavedChanges && !SaveConfigInternal())
                 return;
 
@@ -147,9 +164,10 @@ namespace UIR.EditorTools
             if (_savedConfig != null && Config != null)
             {
                 EditorUtility.CopySerializedManagedFieldsOnly(_savedConfig, Config);
-                _savedConfigSnapshot = SerializeConfig(Config);
+                _savedConfigSnapshot = SerializeConfig(_savedConfig);
             }
 
+            SetExternalChanges(false);
             SetUnsavedChanges(false);
             base.DiscardChanges();
         }
@@ -159,10 +177,32 @@ namespace UIR.EditorTools
             if (Config == null || _savedConfig == null)
                 return false;
 
+            RefreshWindowState();
+            if (HasExternalChanges)
+            {
+                int choice = EditorUtility.DisplayDialogComplex(
+                    "实际配置已被外部修改",
+                    "编辑中的配置和当前实际配置都发生了修改。覆盖保存会丢失外部修改，也可以重新加载当前实际配置并放弃窗口内的修改。",
+                    "覆盖并保存",
+                    "取消",
+                    "重新加载实际配置");
+
+                if (choice == 1)
+                    return false;
+
+                if (choice == 2)
+                {
+                    ReloadFromSavedConfig();
+                    Debug.Log("[ImageImportSettings] 已重新加载当前实际配置，窗口内未保存的修改已放弃。 ");
+                    return true;
+                }
+            }
+
             EditorUtility.CopySerializedManagedFieldsOnly(Config, _savedConfig);
             EditorUtility.SetDirty(_savedConfig);
             AssetDatabase.SaveAssetIfDirty(_savedConfig);
-            _savedConfigSnapshot = SerializeConfig(Config);
+            _savedConfigSnapshot = SerializeConfig(_savedConfig);
+            SetExternalChanges(false);
             SetUnsavedChanges(false);
             Debug.Log("[ImageImportSettings] 配置已保存。 ");
             return true;
@@ -170,17 +210,56 @@ namespace UIR.EditorTools
 
         private void OnInspectorUpdate()
         {
-            RefreshUnsavedChanges();
+            RefreshWindowState();
         }
 
-        private void RefreshUnsavedChanges()
+        private void RefreshWindowState()
         {
-            if (Config == null || _savedConfigSnapshot == null)
+            if (Config == null || _savedConfig == null || _savedConfigSnapshot == null)
                 return;
 
-            bool changed = !string.Equals(_savedConfigSnapshot, SerializeConfig(Config), StringComparison.Ordinal);
-            if (changed != _hasUnsavedChanges)
-                SetUnsavedChanges(changed);
+            string editingSnapshot = SerializeConfig(Config);
+            string currentSavedSnapshot = SerializeConfig(_savedConfig);
+            bool editingChanged = !string.Equals(_savedConfigSnapshot, editingSnapshot, StringComparison.Ordinal);
+            bool savedConfigChanged = !string.Equals(_savedConfigSnapshot, currentSavedSnapshot, StringComparison.Ordinal);
+
+            if (savedConfigChanged && string.Equals(editingSnapshot, currentSavedSnapshot, StringComparison.Ordinal))
+            {
+                _savedConfigSnapshot = currentSavedSnapshot;
+                SetExternalChanges(false);
+                SetUnsavedChanges(false);
+                return;
+            }
+
+            if (savedConfigChanged && !editingChanged)
+            {
+                ReloadFromSavedConfig();
+                return;
+            }
+
+            SetExternalChanges(savedConfigChanged);
+            if (editingChanged != _hasUnsavedChanges)
+                SetUnsavedChanges(editingChanged);
+        }
+
+        private void ReloadFromSavedConfig()
+        {
+            if (Config == null || _savedConfig == null)
+                return;
+
+            EditorUtility.CopySerializedManagedFieldsOnly(_savedConfig, Config);
+            _savedConfigSnapshot = SerializeConfig(_savedConfig);
+            SetExternalChanges(false);
+            SetUnsavedChanges(false);
+        }
+
+        private void SetExternalChanges(bool value)
+        {
+            if (_hasExternalChanges == value)
+                return;
+
+            _hasExternalChanges = value;
+            Repaint();
         }
 
         private void SetUnsavedChanges(bool value)

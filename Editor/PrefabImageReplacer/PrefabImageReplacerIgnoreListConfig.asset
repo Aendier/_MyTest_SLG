@@ -12,9 +12,5 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f3a82619e59af3340927a53aca8ebf0d, type: 3}
   m_Name: PrefabImageReplacerIgnoreListConfig
   m_EditorClassIdentifier: 
-  ignoredPrefabs:
-  - guid: 0a9d9223bfd8ca94493911d566d88bab
-    lastKnownPath: Assets/GameAssets/Art/UI/Prefab/UI_Chat/Bubble/FireFight/UI_Com_Chat_FireFight_Help.prefab
-  ignoredFolders:
-  - guid: 06971aaf05b35de429d9ee8722cc4325
-    lastKnownPath: Assets/GameAssets/Art/UI/Prefab/UI_Chat/Bubble/FireFight
+  ignoredPrefabs: []
+  ignoredFolders: []
