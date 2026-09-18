@@ -28,6 +28,7 @@ namespace UIR.EditorTools
         [NonSerialized]
         private ImageImportSettingsConfig _editingConfig;
         private ImageImportSettingsConfig _savedConfig;
+        private string _editingConfigSnapshot;
         private string _savedConfigSnapshot;
         private bool _hasUnsavedChanges;
         private bool _hasExternalChanges;
@@ -51,6 +52,7 @@ namespace UIR.EditorTools
             DestroyEditingCopy();
             _savedConfig = ImageImportSettingsConfig.LoadOrCreate();
             _editingConfig = CreateEditingCopy(_savedConfig);
+            _editingConfigSnapshot = SerializeConfig(_editingConfig);
             _savedConfigSnapshot = SerializeConfig(_savedConfig);
             SetExternalChanges(false);
             SetUnsavedChanges(false);
@@ -164,6 +166,7 @@ namespace UIR.EditorTools
             if (_savedConfig != null && Config != null)
             {
                 EditorUtility.CopySerializedManagedFieldsOnly(_savedConfig, Config);
+                _editingConfigSnapshot = SerializeConfig(Config);
                 _savedConfigSnapshot = SerializeConfig(_savedConfig);
             }
 
@@ -201,6 +204,7 @@ namespace UIR.EditorTools
             EditorUtility.CopySerializedManagedFieldsOnly(Config, _savedConfig);
             EditorUtility.SetDirty(_savedConfig);
             AssetDatabase.SaveAssetIfDirty(_savedConfig);
+            _editingConfigSnapshot = SerializeConfig(Config);
             _savedConfigSnapshot = SerializeConfig(_savedConfig);
             SetExternalChanges(false);
             SetUnsavedChanges(false);
@@ -215,16 +219,18 @@ namespace UIR.EditorTools
 
         private void RefreshWindowState()
         {
-            if (Config == null || _savedConfig == null || _savedConfigSnapshot == null)
+            if (Config == null || _savedConfig == null ||
+                _editingConfigSnapshot == null || _savedConfigSnapshot == null)
                 return;
 
             string editingSnapshot = SerializeConfig(Config);
             string currentSavedSnapshot = SerializeConfig(_savedConfig);
-            bool editingChanged = !string.Equals(_savedConfigSnapshot, editingSnapshot, StringComparison.Ordinal);
+            bool editingChanged = !string.Equals(_editingConfigSnapshot, editingSnapshot, StringComparison.Ordinal);
             bool savedConfigChanged = !string.Equals(_savedConfigSnapshot, currentSavedSnapshot, StringComparison.Ordinal);
 
             if (savedConfigChanged && string.Equals(editingSnapshot, currentSavedSnapshot, StringComparison.Ordinal))
             {
+                _editingConfigSnapshot = editingSnapshot;
                 _savedConfigSnapshot = currentSavedSnapshot;
                 SetExternalChanges(false);
                 SetUnsavedChanges(false);
@@ -248,6 +254,7 @@ namespace UIR.EditorTools
                 return;
 
             EditorUtility.CopySerializedManagedFieldsOnly(_savedConfig, Config);
+            _editingConfigSnapshot = SerializeConfig(Config);
             _savedConfigSnapshot = SerializeConfig(_savedConfig);
             SetExternalChanges(false);
             SetUnsavedChanges(false);
