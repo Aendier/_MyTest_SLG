@@ -12,7 +12,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c80e441a891836c4aa0b84c6d4a61b28, type: 3}
   m_Name: ImageImportSettingsConfig
   m_EditorClassIdentifier: 
-  Enabled: 1
   Rules:
   - RuleName: "UI\u56FE\u7247\u8D44\u6E90\u8BBE\u7F6E"
     Folders:

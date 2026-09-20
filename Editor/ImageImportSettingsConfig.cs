@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Sirenix.OdinInspector;
 using UnityEditor;
 using UnityEditor.Presets;
 using UnityEngine;
@@ -81,13 +82,33 @@ namespace UIR.EditorTools
             "m_TextureSettings.m_WrapW"
         };
 
-        [InspectorName("启用自动设置")]
-        [Tooltip("关闭后新图片仍会正常导入，但不会自动应用规则")]
-        public bool Enabled = true;
+        private const string EnabledPrefsKey = "UIR.ImageImportSettings.Enabled";
+        private const string VerboseLoggingPrefsKey = "UIR.ImageImportSettings.VerboseLogging";
+
+        [ShowInInspector]
+        [LabelText("启用自动设置（仅本机）")]
+        [Tooltip("保存到当前 Unity 用户的 EditorPrefs；关闭后新图片仍会正常导入，但不会自动应用规则")]
+        public bool Enabled
+        {
+            get => EditorPrefs.GetBool(EnabledPrefsKey, true);
+            set => EditorPrefs.SetBool(EnabledPrefsKey, value);
+        }
 
         [InspectorName("规则列表")]
         [Tooltip("从上到下匹配，第一条符合条件的规则生效")]
         public List<ImageImportSettingsRule> Rules = new List<ImageImportSettingsRule>();
+
+        public static bool VerboseLogging
+        {
+            get => EditorPrefs.GetBool(VerboseLoggingPrefsKey, false);
+            set => EditorPrefs.SetBool(VerboseLoggingPrefsKey, value);
+        }
+
+        public static void LogVerbose(string message)
+        {
+            if (VerboseLogging)
+                Debug.Log($"[ImageImportSettings][Verbose] {message}");
+        }
 
         public ImageImportSettingsRule FindRule(string assetPath)
         {
@@ -100,9 +121,18 @@ namespace UIR.EditorTools
             if (Rules == null)
                 return null;
 
-            foreach (var rule in Rules)
+            for (int index = 0; index < Rules.Count; index++)
             {
-                if (rule != null && rule.Matches(assetPath))
+                var rule = Rules[index];
+                if (rule == null)
+                {
+                    LogVerbose($"规则匹配检查：index={index}，规则为空，assetPath={assetPath}。");
+                    continue;
+                }
+
+                bool matched = rule.Matches(assetPath);
+                LogVerbose($"规则匹配检查：index={index}，规则={rule.RuleName}，matched={matched}，assetPath={assetPath}。");
+                if (matched)
                     return rule;
             }
 
@@ -113,26 +143,50 @@ namespace UIR.EditorTools
         {
             var config = AssetDatabase.LoadAssetAtPath<ImageImportSettingsConfig>(AssetPath);
             if (config != null)
+            {
+                LogVerbose($"加载配置成功：{AssetPath}，本机 Enabled={config.Enabled}，规则数={config.Rules?.Count ?? 0}。");
                 return config;
+            }
 
             config = CreateInstance<ImageImportSettingsConfig>();
             AssetDatabase.CreateAsset(config, AssetPath);
             AssetDatabase.SaveAssets();
+            LogVerbose($"配置不存在，已创建：{AssetPath}，本机 Enabled={config.Enabled}。");
             return config;
         }
 
         /// <summary>应用原生预设；保留已有图片的独立设置，并为新的 Sprite 图片补齐 Unity 默认设置。</summary>
-        public static void ApplyPreset(TextureImporter importer, Preset preset)
+        public static bool ApplyPreset(TextureImporter importer, Preset preset)
         {
-            if (importer == null || preset == null || !preset.CanBeAppliedTo(importer))
-                return;
+            if (importer == null)
+            {
+                LogVerbose("预设未应用：TextureImporter 为空。");
+                return false;
+            }
+
+            if (preset == null)
+            {
+                LogVerbose("预设未应用：Preset 为空。");
+                return false;
+            }
+
+            if (!preset.CanBeAppliedTo(importer))
+            {
+                LogVerbose($"预设未应用：Preset“{preset.name}”不适用于当前 TextureImporter。");
+                return false;
+            }
+
+            string originalState = EditorJsonUtility.ToJson(importer, false);
 
             bool importSettingsMissing = importer.importSettingsMissing;
             SpriteImportMode originalSpriteMode = importer.spriteImportMode;
             var selectedProperties = new List<string>();
             var modifications = preset.PropertyModifications;
             if (modifications == null)
-                return;
+            {
+                LogVerbose($"预设未应用：Preset“{preset.name}”没有属性修改项。");
+                return false;
+            }
 
             foreach (var modification in modifications)
             {
@@ -159,6 +213,8 @@ namespace UIR.EditorTools
                 importer.wrapModeU = TextureWrapMode.Clamp;
                 importer.wrapModeV = TextureWrapMode.Clamp;
             }
+
+            return !string.Equals(originalState, EditorJsonUtility.ToJson(importer, false), StringComparison.Ordinal);
         }
 
         private static bool IsExcludedSpriteProperty(string propertyPath)
@@ -182,21 +238,43 @@ namespace UIR.EditorTools
         private void OnPreprocessTexture()
         {
             var config = GetConfig();
-            if (config == null || !config.Enabled)
+            if (config == null)
+            {
+                ImageImportSettingsConfig.LogVerbose($"跳过导入：配置不存在，assetPath={assetPath}。");
                 return;
+            }
 
-            var rule = config.FindRule(assetPath);
-            if (rule == null || rule.Preset == null)
+            if (!config.Enabled)
+            {
+                ImageImportSettingsConfig.LogVerbose($"跳过导入：本机 Enabled=false，assetPath={assetPath}。");
                 return;
+            }
+
+            var rule = config.FindMatchingRule(assetPath);
+            if (rule == null)
+            {
+                ImageImportSettingsConfig.LogVerbose($"跳过导入：没有匹配规则，assetPath={assetPath}。");
+                return;
+            }
+
+            if (rule.Preset == null)
+            {
+                ImageImportSettingsConfig.LogVerbose($"跳过导入：规则“{rule.RuleName}”未设置预设，assetPath={assetPath}。");
+                return;
+            }
 
             // 统一写入预设中的通用设置；已有图片保留独立设置，新 Sprite 使用 Unity 默认设置。
-            ImageImportSettingsConfig.ApplyPreset((TextureImporter)assetImporter, rule.Preset);
+            bool changed = ImageImportSettingsConfig.ApplyPreset((TextureImporter)assetImporter, rule.Preset);
+            ImageImportSettingsConfig.LogVerbose($"新图片导入处理：assetPath={assetPath}，规则={rule.RuleName}，预设={rule.Preset.name}，changed={changed}。");
         }
 
         private static ImageImportSettingsConfig GetConfig()
         {
             if (_config == null)
+            {
                 _config = AssetDatabase.LoadAssetAtPath<ImageImportSettingsConfig>(ImageImportSettingsConfig.AssetPath);
+                ImageImportSettingsConfig.LogVerbose($"AssetPostprocessor 获取配置：found={_config != null}。");
+            }
             return _config;
         }
 
