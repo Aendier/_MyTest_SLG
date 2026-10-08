@@ -13,10 +13,13 @@ namespace UIR.EditorTools
     /// </summary>
     public class GameViewScreenshotWindow : EditorWindow
     {
-        // EditorPrefs 键：跨会话记忆上次使用的保存目录 / 文件名前缀 / 是否保存后打开目录。
+        // EditorPrefs 键：跨会话记忆上次使用的保存目录 / 文件名前缀 / 是否保存后打开目录 / 截图尺寸倍率。
         private const string PrefKeySavePath = "UIR.GameViewScreenshot.SavePath";
         private const string PrefKeyFilePrefix = "UIR.GameViewScreenshot.FilePrefix";
         private const string PrefKeyOpenAfterSave = "UIR.GameViewScreenshot.OpenAfterSave";
+        private const string PrefKeyCaptureScale = "UIR.GameViewScreenshot.CaptureScale";
+
+        private static readonly float[] CaptureScales = { 0.25f, 0.5f, 1f, 2f };
 
         // 截图完成后的目标动作：保存到文件或复制到剪贴板。
         private enum CaptureAction
@@ -28,6 +31,7 @@ namespace UIR.EditorTools
         private string m_savePath;          // 当前保存目录
         private string m_filePrefix;        // 文件名前缀
         private bool m_openFolderAfterSave; // 保存后是否在资源管理器中打开目录
+        private float m_captureScale = 1f;  // 输出截图相对于 Game 视图的尺寸倍率
 
         private Texture2D m_preview;        // 最近一次截图的预览（本工具创建，需主动销毁）
         private string m_lastMessage;       // 底部状态提示
@@ -50,6 +54,7 @@ namespace UIR.EditorTools
 
             m_filePrefix = EditorPrefs.GetString(PrefKeyFilePrefix, "GameView");
             m_openFolderAfterSave = EditorPrefs.GetBool(PrefKeyOpenAfterSave, true);
+            m_captureScale = GetStoredCaptureScale();
         }
 
         private void OnDisable()
@@ -87,6 +92,8 @@ namespace UIR.EditorTools
                 EditorPrefs.SetBool(PrefKeyOpenAfterSave, m_openFolderAfterSave);
             }
 
+            DrawCaptureScaleSelector();
+
             EditorGUILayout.Space(10f);
             using (new EditorGUILayout.HorizontalScope())
             {
@@ -103,6 +110,29 @@ namespace UIR.EditorTools
 
             DrawPreview();
             DrawMessage();
+        }
+
+        private void DrawCaptureScaleSelector()
+        {
+            int selectedIndex = GetCaptureScaleIndex(m_captureScale);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField(
+                    new GUIContent("截图尺寸", "输出图片相对于 Game 视图的缩放倍率"),
+                    GUILayout.Width(70f));
+
+                for (int i = 0; i < CaptureScales.Length; i++)
+                {
+                    bool selected = GUILayout.Toggle(
+                        selectedIndex == i,
+                        $"{CaptureScales[i]:0.##}x",
+                        EditorStyles.toolbarButton);
+                    if (selected && selectedIndex != i)
+                    {
+                        SetCaptureScale(CaptureScales[i]);
+                    }
+                }
+            }
         }
 
         /// <summary>绘制保存路径行：只读文本 + 选择目录 + 恢复桌面默认。</summary>
@@ -166,6 +196,43 @@ namespace UIR.EditorTools
             EditorPrefs.SetString(PrefKeySavePath, m_savePath);
         }
 
+        private void SetCaptureScale(float scale)
+        {
+            m_captureScale = scale;
+            EditorPrefs.SetFloat(PrefKeyCaptureScale, m_captureScale);
+        }
+
+        private static float GetStoredCaptureScale()
+        {
+            float storedScale = EditorPrefs.GetFloat(PrefKeyCaptureScale, 1f);
+            for (int i = 0; i < CaptureScales.Length; i++)
+            {
+                if (Mathf.Approximately(storedScale, CaptureScales[i]))
+                {
+                    return CaptureScales[i];
+                }
+            }
+
+            return 1f;
+        }
+
+        private static int GetCaptureScaleIndex(float scale)
+        {
+            int nearestIndex = 0;
+            float nearestDistance = Mathf.Abs(scale - CaptureScales[0]);
+            for (int i = 1; i < CaptureScales.Length; i++)
+            {
+                float distance = Mathf.Abs(scale - CaptureScales[i]);
+                if (distance < nearestDistance)
+                {
+                    nearestIndex = i;
+                    nearestDistance = distance;
+                }
+            }
+
+            return nearestIndex;
+        }
+
         /// <summary>
         /// 发起一次截图。运行时与非运行时统一：直接同步读取 Game 视图已渲染的合成结果，
         /// 避免 ScreenCapture 在编辑器回调中因时机问题导致的黑屏/失败。
@@ -185,24 +252,37 @@ namespace UIR.EditorTools
                 return;
             }
 
+            Texture2D output = captured;
             try
             {
-                UpdatePreview(captured);
+                output = ScaleTexture(captured, m_captureScale, out error);
+                if (output == null)
+                {
+                    SetMessage(string.IsNullOrEmpty(error) ? "截图缩放失败。" : $"截图缩放失败：{error}", MessageType.Error);
+                    return;
+                }
+
+                UpdatePreview(output);
 
                 switch (action)
                 {
                     case CaptureAction.SaveToFile:
-                        SaveToFile(captured);
+                        SaveToFile(output);
                         break;
                     case CaptureAction.CopyToClipboard:
-                        CopyToClipboard(captured);
+                        CopyToClipboard(output);
                         break;
                 }
             }
             finally
             {
-                // 预览已复制一份，原始截图纹理可安全释放，避免泄漏。
-                if (captured != null && captured != m_preview)
+                // 预览已复制一份，截图及缩放产生的临时纹理可安全释放，避免泄漏。
+                if (output != null && output != m_preview)
+                {
+                    DestroyImmediate(output);
+                }
+
+                if (captured != null && captured != output && captured != m_preview)
                 {
                     DestroyImmediate(captured);
                 }
@@ -215,6 +295,56 @@ namespace UIR.EditorTools
         private static Texture2D CaptureGameView(out string error)
         {
             return CaptureFromGameView(out error);
+        }
+
+        private static Texture2D ScaleTexture(Texture2D source, float scale, out string error)
+        {
+            error = null;
+            if (source == null)
+            {
+                error = "截图纹理为空。";
+                return null;
+            }
+
+            int width = Mathf.Max(1, Mathf.RoundToInt(source.width * scale));
+            int height = Mathf.Max(1, Mathf.RoundToInt(source.height * scale));
+            if (width == source.width && height == source.height)
+            {
+                return source;
+            }
+
+            RenderTexture temporary = null;
+            RenderTexture previousActive = RenderTexture.active;
+            Texture2D result = null;
+            try
+            {
+                temporary = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(source, temporary);
+                RenderTexture.active = temporary;
+
+                result = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                result.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
+                result.Apply(false);
+                return result;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                if (result != null)
+                {
+                    DestroyImmediate(result);
+                }
+
+                return null;
+            }
+            finally
+            {
+                RenderTexture.active = previousActive;
+                if (temporary != null)
+                {
+                    RenderTexture.ReleaseTemporary(temporary);
+                }
+            }
         }
 
         /// <summary>
