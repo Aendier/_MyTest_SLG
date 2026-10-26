@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
@@ -9,7 +10,7 @@ namespace UIR.EditorTools
     /// <summary>
     /// 大尺寸图片归档工具：
     /// 将“源文件夹”（含子目录）内像素尺寸超过阈值的图片，移动到“目标文件夹”下，
-    /// 并保持与源文件夹一致的目录层级。移动使用 AssetDatabase.MoveAsset，保证 GUID/引用不丢失。
+    /// 并按目标目录格式转换源文件夹的目录层级。移动使用 AssetDatabase.MoveAsset，保证 GUID/引用不丢失。
     /// 本工具自带菜单入口，可独立运行，无需在 UIRMenuRegister 中注册。
     /// </summary>
     public class LargeImageArchiver : EditorWindow
@@ -28,7 +29,7 @@ namespace UIR.EditorTools
         /// </summary>
         private enum FolderPathMode
         {
-            Nested,       // 保持相对目录层级：UI_X/Child/file.png
+            Nested,       // 展开 UI_X_Child 为 UI_X/Child/file.png，并保留其它目录层级
             FullSemantic, // 将相对目录层级拼成语义目录：UI_X_Child/file.png
         }
 
@@ -68,8 +69,8 @@ namespace UIR.EditorTools
         private void OnGUI()
         {
             EditorGUILayout.HelpBox(
-                "将【源文件夹】内像素尺寸超过阈值的图片，移动到【目标文件夹】，并保持相同的目录层级。\n" +
-                "目标目录格式需与 UIFolderCreator 保持一致；Full Semantic 会将目录段合并为下划线。\n" +
+                "将【源文件夹】内像素尺寸超过阈值的图片，移动到【目标文件夹】，并按目标格式转换目录层级。\n" +
+                "目标目录格式需与 UIFolderCreator 保持一致；Nested 会将 UI_X_Child 展开为 UI_X/Child，Full Semantic 会将目录段合并为下划线。\n" +
                 "移动使用 AssetDatabase.MoveAsset，保留 GUID 与引用关系。",
                 MessageType.Info);
 
@@ -266,15 +267,15 @@ namespace UIR.EditorTools
 
         /// <summary>
         /// 根据目标目录格式，将源资源映射到目标路径。
-        /// Full Semantic 会把相对路径中的目录段合并为一个下划线语义目录，
-        /// 文件名及其后的文件层级保持不变。
+        /// Nested 会把每个 UI_语义目录按下划线展开：UI_X_Child -> UI_X/Child，
+        /// 并保留源路径中的其它目录层级；Full Semantic 会把相对路径中的目录段合并为一个下划线语义目录。
         /// </summary>
         private string BuildDestinationPath(string assetPath, string sourcePath, string targetPath)
         {
             string relative = assetPath.Substring(sourcePath.Length + 1).Replace("\\", "/");
             if (_targetPathMode == FolderPathMode.Nested)
             {
-                return targetPath + "/" + relative;
+                return targetPath + "/" + BuildNestedRelativePath(relative);
             }
 
             string[] parts = relative.Split('/');
@@ -286,6 +287,57 @@ namespace UIR.EditorTools
             // 最后一段是文件名；其余段是目录层级，按 FullSemantic 规则合并。
             string semanticFolder = string.Join("_", parts, 0, parts.Length - 1);
             return targetPath + "/" + semanticFolder + "/" + parts[parts.Length - 1];
+        }
+
+        /// <summary>
+        /// 将相对资源路径转换为 Nested 目标路径。
+        /// 以 UI_ 开头的目录按语义展开，前两个片段组成根目录，其余片段成为子目录：
+        /// UI_Alliance_Popup -> UI_Alliance/Popup。
+        /// </summary>
+        private static string BuildNestedRelativePath(string relativePath)
+        {
+            string[] parts = relativePath.Split('/');
+            if (parts.Length <= 1)
+            {
+                return relativePath;
+            }
+
+            List<string> nestedParts = new List<string>();
+            for (int i = 0; i < parts.Length - 1; i++)
+            {
+                AppendNestedFolderParts(nestedParts, parts[i]);
+            }
+
+            // 最后一段是文件名，保留原名与扩展名。
+            nestedParts.Add(parts[parts.Length - 1]);
+            return string.Join("/", nestedParts);
+        }
+
+        /// <summary>
+        /// 将单个 UI_ 语义目录展开为 Nested 目录段。
+        /// 普通目录不拆分，避免改变已有的非 UI 子目录命名。
+        /// </summary>
+        private static void AppendNestedFolderParts(List<string> destinationParts, string folderName)
+        {
+            if (string.IsNullOrEmpty(folderName) ||
+                !folderName.StartsWith("UI_", StringComparison.OrdinalIgnoreCase))
+            {
+                destinationParts.Add(folderName);
+                return;
+            }
+
+            string[] semanticParts = folderName.Split(new[] { '_' }, StringSplitOptions.RemoveEmptyEntries);
+            if (semanticParts.Length < 2)
+            {
+                destinationParts.Add(folderName);
+                return;
+            }
+
+            destinationParts.Add(semanticParts[0] + "_" + semanticParts[1]);
+            for (int i = 2; i < semanticParts.Length; i++)
+            {
+                destinationParts.Add(semanticParts[i]);
+            }
         }
 
         /// <summary>

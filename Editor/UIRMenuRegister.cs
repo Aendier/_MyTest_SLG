@@ -90,5 +90,12 @@ namespace UIR.EditorTools
         {
             ResourceValidationWindow.Open();
         }
+
+        [MenuItem("UIR/贴图压缩测试", false, 307)]
+        private static void Menu_TextureCompression()
+        {
+            // 压缩规则与导入规则共用配置，避免两个入口维护不同的文件夹映射。
+            ImageImportSettingsWindow.Open();
+        }
     }
 }

@@ -3,10 +3,19 @@ using System.Collections.Generic;
 using Sirenix.OdinInspector;
 using UnityEditor;
 using UnityEditor.Presets;
+using UnityEditor.U2D;
 using UnityEngine;
+using UnityEngine.U2D;
 
 namespace UIR.EditorTools
 {
+    public enum ImageCompressionPlatform
+    {
+        Android,
+        iPhone,
+        Both
+    }
+
     [Serializable]
     public sealed class ImageImportSettingsRule
     {
@@ -19,12 +28,50 @@ namespace UIR.EditorTools
         public List<DefaultAsset> Folders = new List<DefaultAsset>();
 
         [InspectorName("导入预设")]
-        [Tooltip("使用 Unity 原生 TextureImporter Preset；已有图片会保留独立维护的 Sprite 数据，新 Sprite 沿用 Unity 默认的 Single 和 Clamp")]
+        [Tooltip("可选。只修改压缩时可以留空；已有图片保留独立维护的 Sprite 数据。平台压缩由下方独立设置控制")]
         public Preset Preset;
 
         [InspectorName("包含子文件夹")]
         [Tooltip("勾选后包含所有子文件夹；取消后仅匹配当前文件夹")]
         public bool IncludeSubfolders = true;
+
+        [FoldoutGroup("压缩设置")]
+        [LabelText("启用压缩设置")]
+        [Tooltip("默认关闭，保留已有规则行为。启用后，同一规则的所有文件夹共用下面的压缩设置")]
+        public bool ApplyCompression;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression))]
+        [LabelText("目标平台")]
+        public ImageCompressionPlatform CompressionPlatform = ImageCompressionPlatform.Android;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression))]
+        [LabelText("压缩格式")]
+        public TextureImporterFormat CompressionFormat = TextureImporterFormat.ASTC_8x8;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression))]
+        [LabelText("同时修改 Max Size")]
+        public bool OverrideMaxSize;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression)), EnableIf(nameof(OverrideMaxSize))]
+        [LabelText("Max Size"), ValueDropdown(nameof(MaxSizeOptions))]
+        public int MaxTextureSize = 2048;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression))]
+        [LabelText("同时修改编码质量")]
+        public bool OverrideCompressionQuality;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression)), EnableIf(nameof(OverrideCompressionQuality))]
+        [LabelText("编码质量"), Range(0, 100)]
+        public int CompressionQuality = 50;
+
+        [FoldoutGroup("压缩设置"), ShowIf(nameof(ApplyCompression))]
+        [LabelText("包含 Sprite Atlas（批量应用）")]
+        [Tooltip("批量应用时同时设置匹配图集的压缩格式；图集不应用 TextureImporter 预设")]
+        public bool IncludeSpriteAtlases;
+
+        private static readonly int[] MaxSizeOptions = { 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 };
+
+        public bool HasSettings => Preset != null || ApplyCompression;
 
         public bool Matches(string assetPath)
         {
@@ -113,7 +160,7 @@ namespace UIR.EditorTools
         public ImageImportSettingsRule FindRule(string assetPath)
         {
             var rule = FindMatchingRule(assetPath);
-            return rule != null && rule.Preset != null ? rule : null;
+            return rule != null && rule.HasSettings ? rule : null;
         }
 
         public ImageImportSettingsRule FindMatchingRule(string assetPath)
@@ -153,6 +200,113 @@ namespace UIR.EditorTools
             AssetDatabase.SaveAssets();
             LogVerbose($"配置不存在，已创建：{AssetPath}，本机 Enabled={config.Enabled}。");
             return config;
+        }
+
+        /// <summary>预设管理通用导入属性，压缩设置独立管理平台属性，避免复制预设中的整个平台数组。</summary>
+        public static bool ApplyRule(TextureImporter importer, ImageImportSettingsRule rule)
+        {
+            if (importer == null || rule == null)
+                return false;
+
+            bool changed = rule.Preset != null && ApplyPreset(importer, rule.Preset);
+            if (rule.ApplyCompression)
+                changed |= ApplyCompressionSettings(rule, importer.GetPlatformTextureSettings,
+                    importer.GetDefaultPlatformTextureSettings, importer.SetPlatformTextureSettings);
+            return changed;
+        }
+
+        public static bool ApplyAtlasCompression(SpriteAtlas atlas, ImageImportSettingsRule rule)
+        {
+            if (atlas == null || rule == null || !rule.ApplyCompression || !rule.IncludeSpriteAtlases)
+                return false;
+
+            return ApplyCompressionSettings(rule, atlas.GetPlatformSettings,
+                () => atlas.GetPlatformSettings("DefaultTexturePlatform"), atlas.SetPlatformSettings);
+        }
+
+        private static bool ApplyCompressionSettings(ImageImportSettingsRule rule,
+            Func<string, TextureImporterPlatformSettings> getSettings,
+            Func<TextureImporterPlatformSettings> getDefaultSettings,
+            Action<TextureImporterPlatformSettings> setSettings)
+        {
+            string[] platforms = rule.CompressionPlatform == ImageCompressionPlatform.Both
+                ? new[] { "Android", "iPhone" }
+                : new[] { rule.CompressionPlatform.ToString() };
+            bool changed = false;
+            foreach (string platform in platforms)
+            {
+                TextureImporterPlatformSettings settings = getSettings(platform);
+                if (settings.overridden && settings.format == rule.CompressionFormat
+                    && (!rule.OverrideMaxSize || settings.maxTextureSize == rule.MaxTextureSize)
+                    && (!rule.OverrideCompressionQuality || settings.compressionQuality == rule.CompressionQuality))
+                    continue;
+
+                // 首次开启平台覆盖时沿用当前生效的默认值，不重新启用平台中残留的旧尺寸和质量。
+                if (!settings.overridden)
+                {
+                    settings = getDefaultSettings();
+                    settings.name = platform;
+                }
+                settings.overridden = true;
+                settings.format = rule.CompressionFormat;
+                if (rule.OverrideMaxSize)
+                    settings.maxTextureSize = rule.MaxTextureSize;
+                if (rule.OverrideCompressionQuality)
+                    settings.compressionQuality = rule.CompressionQuality;
+                setSettings(settings);
+                changed = true;
+            }
+            return changed;
+        }
+
+        /// <summary>只检索已配置的文件夹，并统一使用第一条命中规则，供预览和批量应用复用。</summary>
+        public List<string> FindCandidateAssetPaths()
+        {
+            var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool includeAtlases = false;
+            if (Rules != null)
+            {
+                foreach (ImageImportSettingsRule rule in Rules)
+                {
+                    if (rule == null)
+                        continue;
+                    includeAtlases |= rule.ApplyCompression && rule.IncludeSpriteAtlases;
+                    if (rule.Folders == null)
+                        continue;
+                    foreach (DefaultAsset folderAsset in rule.Folders)
+                    {
+                        if (folderAsset == null)
+                            continue;
+                        string path = AssetDatabase.GetAssetPath(folderAsset);
+                        if (!string.IsNullOrEmpty(path) && AssetDatabase.IsValidFolder(path))
+                            folders.Add(path.Replace('\\', '/').TrimEnd('/'));
+                    }
+                }
+            }
+            if (folders.Count == 0)
+                return new List<string>();
+
+            string[] searchFolders = new List<string>(folders).ToArray();
+            var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string guid in AssetDatabase.FindAssets("t:Texture2D", searchFolders))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (AssetImporter.GetAtPath(path) is TextureImporter && FindMatchingRule(path) != null)
+                    paths.Add(path);
+            }
+            if (includeAtlases)
+            {
+                foreach (string guid in AssetDatabase.FindAssets("t:SpriteAtlas", searchFolders))
+                {
+                    string path = AssetDatabase.GUIDToAssetPath(guid);
+                    ImageImportSettingsRule rule = FindMatchingRule(path);
+                    if (rule != null && rule.ApplyCompression && rule.IncludeSpriteAtlases)
+                        paths.Add(path);
+                }
+            }
+            var result = new List<string>(paths);
+            result.Sort(StringComparer.Ordinal);
+            return result;
         }
 
         /// <summary>应用原生预设；保留已有图片的独立设置，并为新的 Sprite 图片补齐 Unity 默认设置。</summary>
@@ -257,15 +411,15 @@ namespace UIR.EditorTools
                 return;
             }
 
-            if (rule.Preset == null)
+            if (!rule.HasSettings)
             {
-                ImageImportSettingsConfig.LogVerbose($"跳过导入：规则“{rule.RuleName}”未设置预设，assetPath={assetPath}。");
+                ImageImportSettingsConfig.LogVerbose($"跳过导入：规则“{rule.RuleName}”未设置预设或压缩设置，assetPath={assetPath}。");
                 return;
             }
 
             // 统一写入预设中的通用设置；已有图片保留独立设置，新 Sprite 使用 Unity 默认设置。
-            bool changed = ImageImportSettingsConfig.ApplyPreset((TextureImporter)assetImporter, rule.Preset);
-            ImageImportSettingsConfig.LogVerbose($"新图片导入处理：assetPath={assetPath}，规则={rule.RuleName}，预设={rule.Preset.name}，changed={changed}。");
+            bool changed = ImageImportSettingsConfig.ApplyRule((TextureImporter)assetImporter, rule);
+            ImageImportSettingsConfig.LogVerbose($"图片导入处理：assetPath={assetPath}，规则={rule.RuleName}，预设={rule.Preset?.name ?? "无"}，启用压缩={rule.ApplyCompression}，changed={changed}。");
         }
 
         private static ImageImportSettingsConfig GetConfig()

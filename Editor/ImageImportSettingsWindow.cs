@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using Sirenix.OdinInspector;
 using Sirenix.OdinInspector.Editor;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.U2D;
 
 namespace UIR.EditorTools
 {
@@ -25,7 +27,7 @@ namespace UIR.EditorTools
 
         [InfoBox("实际配置已被外部修改。为避免覆盖外部修改，保存时需要选择保留哪一份配置。", InfoMessageType.Warning, VisibleIf = nameof(HasExternalChanges))]
         [InlineEditor(InlineEditorObjectFieldModes.Hidden)]
-        [LabelText("图片导入规则（保存后生效；启用开关为本机设置）")]
+        [LabelText("图片导入与压缩规则（保存后生效；列表靠前的规则优先）")]
         [ShowInInspector, PropertyOrder(-1)]
         private ImageImportSettingsConfig Config
         {
@@ -40,6 +42,10 @@ namespace UIR.EditorTools
         private string _savedConfigSnapshot;
         private bool _hasUnsavedChanges;
         private bool _hasExternalChanges;
+
+        [ShowInInspector, ReadOnly, MultiLineProperty(6), PropertyOrder(3)]
+        [LabelText("匹配预览（按已保存配置生成，应用时重新扫描）")]
+        private string _previewSummary = "尚未预览。";
 
         private bool HasUnsavedChanges => _hasUnsavedChanges;
         private bool HasExternalChanges => _hasExternalChanges;
@@ -92,8 +98,8 @@ namespace UIR.EditorTools
             SaveConfigInternal();
         }
 
-        [Button("应用到已有图片", ButtonSizes.Large), PropertyOrder(1)]
-        [InfoBox("应用预设时会忽略以下内容：已有图片的 Sprite Mode、Sprite Border、Sprite Pivot、Pixels Per Unit、Sprite Sheet、Sprite Mesh Type、Alignment、Physics Shape、Tessellation Detail、Wrap Mode、平台设置。新图片被设置为 Sprite 时，Sprite Mode 默认为 Single，Wrap Mode 默认为 Clamp。", InfoMessageType.Info)]
+        [Button("应用到已有资源", ButtonSizes.Large), PropertyOrder(2)]
+        [InfoBox("每条规则可配置多个文件夹，只应用第一条命中规则。只改压缩时可留空导入预设；压缩默认保留尺寸和编码质量。预设继续保留已有图片的 Sprite 数据、Wrap Mode 和平台设置。图集仅在勾选包含 Sprite Atlas 后通过批量应用处理。", InfoMessageType.Info)]
         [GUIColor(0.35f, 0.8f, 0.45f)]
         private void ApplyToExistingImages()
         {
@@ -118,8 +124,18 @@ namespace UIR.EditorTools
 
             int changed = 0;
             int unchanged = 0;
-            int missingPreset = 0;
-            var paths = FindCandidateTexturePaths(_savedConfig);
+            int missingSettings = 0;
+            int failed = 0;
+            var paths = _savedConfig.FindCandidateAssetPaths();
+            if (paths.Count == 0)
+            {
+                EditorUtility.DisplayDialog("提示", "已保存的规则没有匹配到图片或图集。", "确定");
+                return;
+            }
+            // 批量执行前展示真实命中数量，避免规则列表调整后误用旧预览。
+            _previewSummary = BuildPreviewSummary(_savedConfig, paths);
+            if (!EditorUtility.DisplayDialog("应用图片导入与压缩设置", _previewSummary, "应用", "取消"))
+                return;
             bool cancelled = false;
             ImageImportSettingsConfig.LogVerbose($"开始批量应用：Enabled={_savedConfig.Enabled}，候选图片数={paths.Count}，规则数={_savedConfig.Rules?.Count ?? 0}。");
             AssetDatabase.StartAssetEditing();
@@ -149,27 +165,44 @@ namespace UIR.EditorTools
                         continue;
                     }
 
-                    if (rule.Preset == null)
+                    if (!rule.HasSettings)
                     {
-                        missingPreset++;
-                        ImageImportSettingsConfig.LogVerbose($"批处理跳过：规则“{rule.RuleName}”未设置预设，assetPath={path}。");
+                        missingSettings++;
+                        ImageImportSettingsConfig.LogVerbose($"批处理跳过：规则“{rule.RuleName}”未设置预设或压缩设置，assetPath={path}。");
                         continue;
                     }
 
-                    var importer = AssetImporter.GetAtPath(path) as TextureImporter;
-                    if (importer == null)
-                        continue;
-
-                    if (ImageImportSettingsConfig.ApplyPreset(importer, rule.Preset))
+                    try
                     {
-                        importer.SaveAndReimport();
-                        changed++;
-                        ImageImportSettingsConfig.LogVerbose($"批处理已应用：assetPath={path}，规则={rule.RuleName}，预设={rule.Preset.name}。");
+                        var importer = AssetImporter.GetAtPath(path) as TextureImporter;
+                        bool assetChanged;
+                        if (importer != null)
+                        {
+                            assetChanged = ImageImportSettingsConfig.ApplyRule(importer, rule);
+                            if (assetChanged)
+                                importer.SaveAndReimport();
+                        }
+                        else
+                        {
+                            SpriteAtlas atlas = AssetDatabase.LoadAssetAtPath<SpriteAtlas>(path);
+                            assetChanged = ImageImportSettingsConfig.ApplyAtlasCompression(atlas, rule);
+                            if (assetChanged)
+                            {
+                                EditorUtility.SetDirty(atlas);
+                                AssetDatabase.SaveAssetIfDirty(atlas);
+                                AssetDatabase.ImportAsset(path);
+                            }
+                        }
+                        if (assetChanged)
+                            changed++;
+                        else
+                            unchanged++;
+                        ImageImportSettingsConfig.LogVerbose($"批处理已检查：assetPath={path}，规则={rule.RuleName}，changed={assetChanged}。");
                     }
-                    else
+                    catch (Exception exception)
                     {
-                        unchanged++;
-                        ImageImportSettingsConfig.LogVerbose($"批处理未产生变化：assetPath={path}，规则={rule.RuleName}，预设={rule.Preset.name}；可能已是目标状态或预设不适用。");
+                        failed++;
+                        Debug.LogError($"[ImageImportSettings] 应用失败：{path}\n{exception}");
                     }
                 }
             }
@@ -180,11 +213,57 @@ namespace UIR.EditorTools
             }
 
             string resultSuffix = cancelled ? " 操作已取消。" : string.Empty;
-            ImageImportSettingsConfig.LogVerbose($"批量应用结束：候选={paths.Count}，已应用={changed}，无需修改={unchanged}，缺少预设={missingPreset}，cancelled={cancelled}。");
-            if (missingPreset > 0)
-                Debug.LogWarning($"[ImageImportSettings] 已检索 {paths.Count} 张候选图片，应用 {changed} 张，{unchanged} 张无需修改；有 {missingPreset} 张图片匹配到规则但未设置预设，因此未修改。{resultSuffix}");
+            string result = $"[ImageImportSettings] 候选资源 {paths.Count} 个，已应用 {changed}，无需修改 {unchanged}，缺少设置 {missingSettings}，失败 {failed}，未处理 {paths.Count - changed - unchanged - missingSettings - failed}。{resultSuffix}";
+            if (missingSettings > 0 || failed > 0)
+                Debug.LogWarning(result);
             else
-                Debug.Log($"[ImageImportSettings] 已检索 {paths.Count} 张候选图片，应用 {changed} 张，{unchanged} 张无需修改。{resultSuffix}");
+                Debug.Log(result);
+        }
+
+        [Button("预览匹配结果", ButtonSizes.Large), PropertyOrder(1)]
+        private void PreviewRules()
+        {
+            RefreshWindowState();
+            if (_savedConfig == null || Config == null)
+                return;
+            if (HasUnsavedChanges)
+            {
+                EditorUtility.DisplayDialog("配置尚未保存", "请先保存配置，再预览实际生效的规则。", "确定");
+                return;
+            }
+            _previewSummary = BuildPreviewSummary(_savedConfig, _savedConfig.FindCandidateAssetPaths());
+        }
+
+        private static string BuildPreviewSummary(ImageImportSettingsConfig config, List<string> paths)
+        {
+            var textureCounts = new Dictionary<ImageImportSettingsRule, int>();
+            var atlasCounts = new Dictionary<ImageImportSettingsRule, int>();
+            foreach (string path in paths)
+            {
+                ImageImportSettingsRule rule = config.FindMatchingRule(path);
+                if (rule == null)
+                    continue;
+                Dictionary<ImageImportSettingsRule, int> counts = AssetImporter.GetAtPath(path) is TextureImporter
+                    ? textureCounts : atlasCounts;
+                counts.TryGetValue(rule, out int count);
+                counts[rule] = count + 1;
+            }
+
+            var text = new StringBuilder($"共匹配 {paths.Count} 个资源；每个资源只应用列表中第一条命中规则。\n");
+            if (config.Rules == null)
+                return text.ToString();
+            foreach (ImageImportSettingsRule rule in config.Rules)
+            {
+                if (rule == null)
+                    continue;
+                textureCounts.TryGetValue(rule, out int textures);
+                atlasCounts.TryGetValue(rule, out int atlases);
+                string settings = rule.HasSettings ? (rule.Preset != null ? $"预设 {rule.Preset.name}" : "仅压缩") : "未设置，将跳过";
+                if (rule.ApplyCompression)
+                    settings += $" / {rule.CompressionPlatform} / {rule.CompressionFormat} / 尺寸 {(rule.OverrideMaxSize ? rule.MaxTextureSize.ToString() : "保留")} / 质量 {(rule.OverrideCompressionQuality ? rule.CompressionQuality.ToString() : "保留")}";
+                text.AppendLine($"{rule.RuleName}：图片 {textures}，图集 {atlases}；{settings}");
+            }
+            return text.ToString();
         }
 
         public override void SaveChanges()
@@ -308,6 +387,8 @@ namespace UIR.EditorTools
         {
             _hasUnsavedChanges = value;
             hasUnsavedChanges = value;
+            if (value)
+                _previewSummary = "配置已变化，请保存后重新预览。";
             Repaint();
         }
 
@@ -340,58 +421,5 @@ namespace UIR.EditorTools
             _editingConfig = null;
         }
 
-        private static bool IsTexturePath(string path)
-        {
-            string extension = System.IO.Path.GetExtension(path).ToLowerInvariant();
-            return extension == ".png" || extension == ".jpg" || extension == ".jpeg" ||
-                   extension == ".tga" || extension == ".psd" || extension == ".tif" || extension == ".tiff" ||
-                   extension == ".exr" || extension == ".gif" || extension == ".bmp";
-        }
-
-        private static List<string> FindCandidateTexturePaths(ImageImportSettingsConfig config)
-        {
-            var searchFolders = new List<string>();
-            var seenFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (config == null || config.Rules == null)
-                return searchFolders;
-
-            foreach (var rule in config.Rules)
-            {
-                if (rule == null || rule.Folders == null)
-                    continue;
-
-                foreach (var folderAsset in rule.Folders)
-                {
-                    if (folderAsset == null)
-                        continue;
-
-                    string folder = AssetDatabase.GetAssetPath(folderAsset);
-                    if (string.IsNullOrEmpty(folder) || !AssetDatabase.IsValidFolder(folder))
-                        continue;
-
-                    folder = folder.Replace('\\', '/').TrimEnd('/');
-                    if (seenFolders.Add(folder))
-                        searchFolders.Add(folder);
-                }
-            }
-
-            if (searchFolders.Count == 0)
-                return new List<string>();
-
-            ImageImportSettingsConfig.LogVerbose($"按规则文件夹检索：{string.Join(", ", searchFolders)}。");
-            string[] guids = AssetDatabase.FindAssets("t:Texture2D", searchFolders.ToArray());
-            var paths = new List<string>(guids.Length);
-            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string guid in guids)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guid);
-                if (IsTexturePath(path) && seenPaths.Add(path))
-                    paths.Add(path);
-            }
-
-            ImageImportSettingsConfig.LogVerbose($"按规则文件夹检索完成：FindAssets 返回 {guids.Length} 个 GUID，过滤后候选图片 {paths.Count} 张。");
-
-            return paths;
-        }
     }
 }
